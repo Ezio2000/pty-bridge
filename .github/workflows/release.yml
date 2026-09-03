@@ -60,7 +60,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --workspace --release --locked --target ${{ matrix.target }}
       - run: node scripts/stage-native.cjs ${{ matrix.package }} ${{ matrix.binary }}
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: native-${{ matrix.package }}
           path: packages/${{ matrix.package }}/bin/*
@@ -80,7 +80,7 @@ jobs:
           node-version: "24"
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v8
         with:
           pattern: native-*
           path: artifacts
