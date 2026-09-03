@@ -20,11 +20,15 @@ for (const target of targets) {
 
 const plugin = require(path.join(root, 'packages/plugin/package.json'));
 const manifest = require(path.join(root, 'packages/plugin/.claude-plugin/plugin.json'));
+const hooks = require(path.join(root, 'packages/plugin/hooks/hooks.json'));
 if (manifest.version !== expectedVersion) throw new Error('Plugin manifest/npm version mismatch');
 if (!plugin.files.includes('native')) throw new Error('Plugin package must include bundled native binaries');
 if (!plugin.files.includes('skills')) throw new Error('Plugin package must include its PTY skill');
 if (!fs.existsSync(path.join(root, 'packages/plugin/skills/pty/SKILL.md'))) {
   throw new Error('PTY workflow skill is missing');
+}
+if (hooks.hooks.PostToolUse?.[0]?.matcher !== 'mcp__plugin_pty-bridge_pty__start') {
+  throw new Error('PostToolUse hook must match the plugin-qualified PTY start tool');
 }
 for (const target of targets) {
   if (plugin.optionalDependencies[`@pty-bridge/${target}`] !== expectedVersion) {

@@ -3,7 +3,7 @@
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "mcp__pty__start",
+        "matcher": "mcp__plugin_pty-bridge_pty__start",
         "hooks": [
           {
             "type": "command",

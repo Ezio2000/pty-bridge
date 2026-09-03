@@ -11,7 +11,7 @@ The repository keeps the host-specific project name at the boundary. Plugin, MCP
 ```text
 Host session
     |
-    |  mcp__pty__start(program, args, cwd)
+    |  mcp__plugin_pty-bridge_pty__start(program, args, cwd)
     v
 MCP server (pty-bridge)
     |
@@ -28,7 +28,7 @@ Background Task -- reads ticket out of band --> loopback authentication
     |                                             +-- spawn target in PTY
     |                                             +-- stream throttled status/tail
     v
-LLM uses mcp__pty__read/write/resize/signal/status/close
+LLM uses mcp__plugin_pty-bridge_pty__read/write/resize/signal/status/close
 
 PostToolUse hook: bind host session -> PTY session ownership
 SessionEnd hook: authenticate over the private control channel -> close owned PTYs

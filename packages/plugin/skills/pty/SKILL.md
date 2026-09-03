@@ -5,9 +5,9 @@ description: Use a real interactive terminal through pty-bridge for REPLs, TUIs,
 
 # Interactive PTY workflow
 
-Use `mcp__pty__start` when a command needs a real terminal or continued interaction.
+Use `mcp__plugin_pty-bridge_pty__start` when a command needs a real terminal or continued interaction.
 
-Immediately after every successful `mcp__pty__start` call:
+Immediately after every successful `mcp__plugin_pty-bridge_pty__start` call:
 
 1. Copy `background_task_command` from the tool result exactly.
 2. Invoke the Bash tool with that command and `run_in_background: true`.
@@ -18,11 +18,11 @@ The Background Task is the live display and lifecycle owner for the PTY. It rema
 
 After attachment, use:
 
-- `mcp__pty__read` to read retained terminal output from a cursor.
-- `mcp__pty__write` to answer prompts or send control characters.
-- `mcp__pty__resize` before interacting with a full-screen TUI when dimensions matter.
-- `mcp__pty__signal` for interrupt, terminate, or kill behavior.
-- `mcp__pty__status` to inspect state when needed.
-- `mcp__pty__close` when the task is complete or abandoned.
+- `mcp__plugin_pty-bridge_pty__read` to read retained terminal output from a cursor.
+- `mcp__plugin_pty-bridge_pty__write` to answer prompts or send control characters.
+- `mcp__plugin_pty-bridge_pty__resize` before interacting with a full-screen TUI when dimensions matter.
+- `mcp__plugin_pty-bridge_pty__signal` for interrupt, terminate, or kill behavior.
+- `mcp__plugin_pty-bridge_pty__status` to inspect state when needed.
+- `mcp__plugin_pty-bridge_pty__close` when the task is complete or abandoned.
 
 Always preserve the `session_id` and `next_cursor` returned by the tools. Continue reading from `next_cursor` so output is not duplicated. A `SessionEnd` hook closes sessions if the conversation ends unexpectedly.
