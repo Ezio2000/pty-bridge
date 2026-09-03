@@ -192,6 +192,38 @@ impl Session {
         let _ = self.events.send(event);
     }
 
+    fn record_output(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.output.lock().expect("output poisoned").append(bytes);
+        self.lifecycle
+            .lock()
+            .expect("session lifecycle poisoned")
+            .last_activity_ms = runtime::now_ms();
+        let preview = sanitize_summary(bytes, 512);
+        if !preview.is_empty() {
+            self.event(SessionEvent::Output { preview });
+        }
+    }
+
+    fn write_terminal_response(&self, bytes: &[u8]) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let mut lifecycle = self.lifecycle.lock().expect("session lifecycle poisoned");
+        if lifecycle.state != SessionState::Running {
+            return Ok(());
+        }
+        let Some(resources) = lifecycle.resources.as_mut() else {
+            return Ok(());
+        };
+        resources.writer.write_all(bytes)?;
+        resources.writer.flush()?;
+        lifecycle.last_activity_ms = runtime::now_ms();
+        Ok(())
+    }
+
     fn snapshot(&self) -> SessionSnapshot {
         let lifecycle = self.lifecycle.lock().expect("session lifecycle poisoned");
         let output = self.output.lock().expect("output buffer poisoned");
@@ -579,24 +611,19 @@ impl Manager {
             .name("pty-reader".into())
             .spawn(move || -> Option<String> {
                 let mut buf = [0u8; 8192];
+                let mut protocol = TerminalProtocol::default();
                 loop {
                     match reader.read(&mut buf) {
-                        Ok(0) => return None,
+                        Ok(0) => {
+                            read_session.record_output(&protocol.finish());
+                            return None;
+                        }
                         Ok(n) => {
-                            read_session
-                                .output
-                                .lock()
-                                .expect("output poisoned")
-                                .append(&buf[..n]);
-                            read_session
-                                .lifecycle
-                                .lock()
-                                .expect("session lifecycle poisoned")
-                                .last_activity_ms = runtime::now_ms();
-                            let preview = sanitize_summary(&buf[..n], 512);
-                            if !preview.is_empty() {
-                                read_session.event(SessionEvent::Output { preview });
+                            let (visible, response) = protocol.process(&buf[..n]);
+                            if let Err(error) = read_session.write_terminal_response(&response) {
+                                return Some(format!("terminal protocol response failed: {error}"));
                             }
+                            read_session.record_output(&visible);
                         }
                         Err(error) => return Some(error.to_string()),
                     }
@@ -1252,6 +1279,46 @@ fn sanitize_summary(bytes: &[u8], max_chars: usize) -> String {
         .collect()
 }
 
+#[derive(Default)]
+struct TerminalProtocol {
+    pending: Vec<u8>,
+}
+
+impl TerminalProtocol {
+    fn process(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        const QUERIES: [(&[u8], &[u8]); 3] = [
+            (b"\x1b[5n", b"\x1b[0n"),
+            (b"\x1b[6n", b"\x1b[1;1R"),
+            (b"\x1b[?6n", b"\x1b[?1;1R"),
+        ];
+
+        self.pending.extend_from_slice(bytes);
+        let mut visible = Vec::with_capacity(self.pending.len());
+        let mut response = Vec::new();
+        let mut consumed = 0;
+        while consumed < self.pending.len() {
+            let rest = &self.pending[consumed..];
+            if let Some((query, answer)) = QUERIES.iter().find(|(query, _)| rest.starts_with(query))
+            {
+                consumed += query.len();
+                response.extend_from_slice(answer);
+                continue;
+            }
+            if QUERIES.iter().any(|(query, _)| query.starts_with(rest)) {
+                break;
+            }
+            visible.push(self.pending[consumed]);
+            consumed += 1;
+        }
+        self.pending.drain(..consumed);
+        (visible, response)
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.pending
+    }
+}
+
 pub fn default_spec(program: String, args: Vec<String>, cwd: PathBuf) -> StartSpec {
     StartSpec {
         program,
@@ -1278,5 +1345,18 @@ mod tests {
     #[test]
     fn sanitizes_control_characters() {
         assert_eq!(sanitize_summary(b"a\x00b\n", 8), "ab\n");
+    }
+
+    #[test]
+    fn answers_terminal_status_queries_across_read_boundaries() {
+        let mut protocol = TerminalProtocol::default();
+        let (visible, response) = protocol.process(b"before\x1b[");
+        assert_eq!(visible, b"before");
+        assert!(response.is_empty());
+
+        let (visible, response) = protocol.process(b"6nafter\x1b[5n");
+        assert_eq!(visible, b"after");
+        assert_eq!(response, b"\x1b[1;1R\x1b[0n");
+        assert!(protocol.finish().is_empty());
     }
 }
