@@ -1,8 +1,8 @@
 {
   "name": "pty-bridge-workspace",
   "private": true,
-  "version": "0.2.2",
-  "workspaces": ["packages/*"],
+  "version": "1.0.0",
+  "workspaces": ["packages/plugin"],
   "scripts": {
     "check": "node scripts/check-packages.cjs",
     "test": "npm run check && cargo test --workspace",

@@ -1,6 +1,6 @@
 use std::{
     fs::{self, OpenOptions},
-    io::Write,
+    io::{ErrorKind, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -27,6 +27,18 @@ pub struct Ownership {
     pub port: u16,
 }
 
+#[derive(Debug, Clone)]
+pub struct OwnershipEntry {
+    pub record: Ownership,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Default)]
+pub struct OwnershipScan {
+    pub entries: Vec<OwnershipEntry>,
+    pub errors: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlRecord {
     pub instance_id: String,
@@ -42,54 +54,60 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-pub fn runtime_root() -> Result<PathBuf> {
+pub fn runtime_root_path() -> Result<PathBuf> {
     #[cfg(unix)]
-    let path = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let uid = unsafe { libc::getuid() };
-            std::env::temp_dir().join(format!("{APP_NAME}-{uid}"))
-        });
+    {
+        if let Some(base) = std::env::var_os("XDG_RUNTIME_DIR") {
+            let base = PathBuf::from(base);
+            if base.is_absolute() {
+                return Ok(base.join(APP_NAME));
+            }
+        }
+        let uid = unsafe { libc::getuid() };
+        Ok(std::env::temp_dir().join(format!("{APP_NAME}-{uid}")))
+    }
 
     #[cfg(windows)]
-    let path = dirs::data_local_dir()
-        .context("unable to locate LocalAppData")?
-        .join(APP_NAME)
-        .join("runtime");
+    {
+        Ok(dirs::data_local_dir()
+            .context("unable to locate LocalAppData")?
+            .join(APP_NAME)
+            .join("runtime"))
+    }
+}
 
-    fs::create_dir_all(&path).context("create runtime directory")?;
-    set_private_dir(&path)?;
+pub fn runtime_root() -> Result<PathBuf> {
+    let path = runtime_root_path()?;
+    ensure_private_dir(&path)?;
     Ok(path)
 }
 
-pub fn instance_dir(instance_id: &str) -> Result<PathBuf> {
+fn instance_path(instance_id: &str) -> Result<PathBuf> {
     validate_id(instance_id)?;
-    let path = runtime_root()?.join(instance_id);
-    fs::create_dir_all(&path)?;
-    set_private_dir(&path)?;
+    Ok(runtime_root_path()?.join(instance_id))
+}
+
+fn ensure_instance(instance_id: &str) -> Result<PathBuf> {
+    let path = instance_path(instance_id)?;
+    ensure_private_dir(&path)?;
     Ok(path)
+}
+
+pub fn remove_instance(instance_id: &str) {
+    if let Ok(path) = instance_path(instance_id) {
+        let _ = fs::remove_dir_all(path);
+    }
 }
 
 pub fn background_task_ticket_path(instance_id: &str, session_id: &str) -> Result<PathBuf> {
     validate_id(session_id)?;
-    Ok(instance_dir(instance_id)?.join(format!("{session_id}.bgtask")))
+    Ok(instance_path(instance_id)?.join(format!("{session_id}.bgtask")))
 }
 
 pub fn write_background_task_ticket(ticket: &BackgroundTaskTicket) -> Result<PathBuf> {
-    let path = background_task_ticket_path(&ticket.instance_id, &ticket.session_id)?;
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts
-        .open(&path)
-        .context("create private background task ticket")?;
-    serde_json::to_writer(&mut file, ticket)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
+    validate_id(&ticket.session_id)?;
+    let path = ensure_instance(&ticket.instance_id)?.join(format!("{}.bgtask", ticket.session_id));
+    write_private_json_new(&path, ticket).context("create private background task ticket")?;
     Ok(path)
 }
 
@@ -101,6 +119,9 @@ pub fn read_background_task_ticket(
     let data = fs::read(&path).context("read background task ticket")?;
     let ticket: BackgroundTaskTicket =
         serde_json::from_slice(&data).context("parse background task ticket")?;
+    if ticket.instance_id != instance_id || ticket.session_id != session_id {
+        bail!("background task ticket identity mismatch");
+    }
     if ticket.expires_at_ms < now_ms() {
         let _ = fs::remove_file(&path);
         bail!("background task ticket expired");
@@ -114,81 +135,145 @@ pub fn remove_background_task_ticket(instance_id: &str, session_id: &str) {
     }
 }
 
+fn control_path(instance_id: &str, session_id: &str) -> Result<PathBuf> {
+    validate_id(session_id)?;
+    Ok(instance_path(instance_id)?.join(format!("{session_id}.control")))
+}
+
 pub fn write_control(record: &ControlRecord) -> Result<()> {
-    let path = instance_dir(&record.instance_id)?.join(format!("{}.control", record.session_id));
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(path)?;
-    serde_json::to_writer(&mut file, record)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    Ok(())
+    validate_id(&record.session_id)?;
+    let path = ensure_instance(&record.instance_id)?.join(format!("{}.control", record.session_id));
+    write_private_json_new(&path, record).context("create private control credential")
 }
 
 pub fn read_control(instance_id: &str, session_id: &str) -> Result<ControlRecord> {
-    validate_id(session_id)?;
-    let path = instance_dir(instance_id)?.join(format!("{session_id}.control"));
-    serde_json::from_slice(&fs::read(path)?).context("parse control record")
+    let path = control_path(instance_id, session_id)?;
+    let data = fs::read(&path).context("read control credential")?;
+    let record: ControlRecord =
+        serde_json::from_slice(&data).context("parse control credential")?;
+    if record.instance_id != instance_id || record.session_id != session_id {
+        bail!("control credential identity mismatch");
+    }
+    Ok(record)
 }
 
 pub fn remove_control(instance_id: &str, session_id: &str) {
-    if let Ok(path) = instance_dir(instance_id) {
-        let _ = fs::remove_file(path.join(format!("{session_id}.control")));
+    if let Ok(path) = control_path(instance_id, session_id) {
+        let _ = fs::remove_file(path);
     }
 }
 
-pub fn ownership_dir(host_session_id: &str) -> Result<PathBuf> {
+fn ownership_dir_path(host_session_id: &str) -> Result<PathBuf> {
     validate_id(host_session_id)?;
-    let path = runtime_root()?.join("owners").join(host_session_id);
-    fs::create_dir_all(&path)?;
-    set_private_dir(&path)?;
-    Ok(path)
+    Ok(runtime_root_path()?.join("owners").join(host_session_id))
+}
+
+fn ownership_path(host_session_id: &str, instance_id: &str, session_id: &str) -> Result<PathBuf> {
+    validate_id(instance_id)?;
+    validate_id(session_id)?;
+    Ok(ownership_dir_path(host_session_id)?.join(format!("{instance_id}--{session_id}.json")))
 }
 
 pub fn write_ownership(record: &Ownership) -> Result<()> {
-    let path = ownership_dir(&record.host_session_id)?.join(format!(
+    validate_id(&record.instance_id)?;
+    validate_id(&record.session_id)?;
+    let dir = ownership_dir_path(&record.host_session_id)?;
+    ensure_private_dir(&dir)?;
+    let path = dir.join(format!(
         "{}--{}.json",
         record.instance_id, record.session_id
     ));
-    let mut opts = OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+    write_private_json_new(&path, record).context("create ownership record")
+}
+
+pub fn read_ownership(host_session_id: &str) -> Result<OwnershipScan> {
+    let dir = ownership_dir_path(host_session_id)?;
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(OwnershipScan::default()),
+        Err(error) => return Err(error).context("read ownership directory"),
+    };
+    let mut scan = OwnershipScan::default();
+    for entry in entries {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(error) => {
+                scan.errors.push(format!("read ownership entry: {error}"));
+                continue;
+            }
+        };
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let data = match fs::read(&path) {
+            Ok(data) => data,
+            Err(error) => {
+                scan.errors
+                    .push(format!("read ownership record {}: {error}", path.display()));
+                continue;
+            }
+        };
+        let record: Ownership = match serde_json::from_slice(&data) {
+            Ok(record) => record,
+            Err(error) => {
+                scan.errors.push(format!(
+                    "parse ownership record {}: {error}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        if let Err(error) = validate_ownership(&record, host_session_id) {
+            scan.errors.push(format!(
+                "validate ownership record {}: {error}",
+                path.display()
+            ));
+            continue;
+        }
+        scan.entries.push(OwnershipEntry { record, path });
     }
-    let mut file = opts.open(path)?;
-    serde_json::to_writer(&mut file, record)?;
-    file.write_all(b"\n")?;
+    Ok(scan)
+}
+
+fn validate_ownership(record: &Ownership, host_session_id: &str) -> Result<()> {
+    validate_id(&record.host_session_id)?;
+    validate_id(&record.instance_id)?;
+    validate_id(&record.session_id)?;
+    if record.host_session_id != host_session_id {
+        bail!("host session mismatch");
+    }
     Ok(())
 }
 
-pub fn read_ownership(host_session_id: &str) -> Result<Vec<Ownership>> {
-    let dir = ownership_dir(host_session_id)?;
-    let mut records = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.extension().and_then(|v| v.to_str()) != Some("json") {
-            continue;
-        }
-        if let Ok(data) = fs::read(&path)
-            && let Ok(record) = serde_json::from_slice(&data)
-        {
-            records.push(record);
-        }
+pub fn remove_ownership_record(host_session_id: &str, instance_id: &str, session_id: &str) {
+    if let Ok(path) = ownership_path(host_session_id, instance_id, session_id) {
+        let _ = fs::remove_file(path);
     }
-    Ok(records)
+    remove_empty_ownership_dir(host_session_id);
 }
 
-pub fn remove_ownership(host_session_id: &str) {
-    if let Ok(path) = ownership_dir(host_session_id) {
-        let _ = fs::remove_dir_all(path);
+pub fn remove_ownership_entry(entry: &OwnershipEntry) {
+    let _ = fs::remove_file(&entry.path);
+    remove_empty_ownership_dir(&entry.record.host_session_id);
+}
+
+fn remove_empty_ownership_dir(host_session_id: &str) {
+    let Ok(dir) = ownership_dir_path(host_session_id) else {
+        return;
+    };
+    let is_empty = fs::read_dir(&dir)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false);
+    if is_empty {
+        let _ = fs::remove_dir(dir);
     }
+}
+
+pub fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .is_some_and(|error| error.kind() == ErrorKind::NotFound)
 }
 
 pub fn validate_id(value: &str) -> Result<()> {
@@ -196,10 +281,30 @@ pub fn validate_id(value: &str) -> Result<()> {
         || value.len() > 128
         || !value
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
     {
         bail!("invalid identifier");
     }
+    Ok(())
+}
+
+fn ensure_private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).with_context(|| format!("create directory {}", path.display()))?;
+    set_private_dir(path)
+}
+
+fn write_private_json_new(path: &Path, value: &impl Serialize) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    serde_json::to_writer(&mut file, value)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
     Ok(())
 }
 

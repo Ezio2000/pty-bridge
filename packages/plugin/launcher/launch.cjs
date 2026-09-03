@@ -27,15 +27,9 @@ function resolveBinary() {
   if (fs.existsSync(bundled)) {
     return bundled;
   }
-  const packageName = `@pty-bridge/${target}`;
-  try {
-    const manifest = require.resolve(`${packageName}/package.json`);
-    return path.join(path.dirname(manifest), 'bin', binaryName);
-  } catch (error) {
-    const local = path.resolve(__dirname, '..', '..', '..', 'target', 'debug', binaryName);
-    if (fs.existsSync(local)) return local;
-    throw new Error(`Native package ${packageName} is missing. Reinstall @pty-bridge/plugin for ${target}.`, { cause: error });
-  }
+  const local = path.resolve(__dirname, '..', '..', '..', 'target', 'debug', binaryName);
+  if (fs.existsSync(local)) return local;
+  throw new Error(`Bundled native binary is missing for ${target}. Reinstall @pty-bridge/plugin.`);
 }
 
 let binary;

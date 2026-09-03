@@ -63,7 +63,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: native-${{ matrix.package }}
-          path: packages/${{ matrix.package }}/bin/*
+          path: packages/plugin/native/${{ matrix.package }}/*
           if-no-files-found: error
 
   publish:
@@ -97,22 +97,9 @@ jobs:
             node scripts/stage-native.cjs "$target" "artifacts/native-$target/$binary"
           done
           cp LICENSE packages/plugin/LICENSE
+          node scripts/check-packages.cjs --release
       - name: Inspect package tarballs
-        run: |
-          for target in darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-arm64 win32-x64 plugin; do
-            npm pack "./packages/$target" --dry-run
-          done
-      - name: Publish native packages
-        run: |
-          version=$(node -p "require('./packages/plugin/package.json').version")
-          for target in darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-arm64 win32-x64; do
-            package="@pty-bridge/$target"
-            if npm view "$package@$version" version >/dev/null 2>&1; then
-              echo "$package@$version is already published; skipping"
-            else
-              npm publish "./packages/$target" --access public
-            fi
-          done
+        run: npm pack ./packages/plugin --dry-run
       - name: Publish plugin
         run: |
           package=$(node -p "require('./packages/plugin/package.json').name")

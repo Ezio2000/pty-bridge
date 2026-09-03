@@ -4,7 +4,6 @@
       "command": "node",
       "args": ["${CLAUDE_PLUGIN_ROOT}/launcher/launch.cjs", "mcp"],
       "env": {
-        "PTY_BRIDGE_PLUGIN_ROOT": "${CLAUDE_PLUGIN_ROOT}",
         "PTY_BRIDGE_PROJECT_DIR": "${CLAUDE_PROJECT_DIR}"
       }
     }

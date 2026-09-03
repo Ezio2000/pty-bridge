@@ -1,1 +1,0 @@
-{"name":"@pty-bridge/win32-x64","version":"0.2.2","license":"Apache-2.0","repository":{"type":"git","url":"git+https://github.com/Ezio2000/pty-bridge.git"},"os":["win32"],"cpu":["x64"],"files":["bin","README.md","LICENSE"],"publishConfig":{"access":"public","provenance":true}}
