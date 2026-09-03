@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "pty-bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Cross-platform interactive PTY sessions with background monitoring",
   "author": {
     "name": "ezio2000"

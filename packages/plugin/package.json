@@ -1,6 +1,6 @@
 {
   "name": "@pty-bridge/plugin",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Cross-platform interactive PTY plugin",
   "license": "Apache-2.0",
   "repository": {
@@ -15,16 +15,17 @@
     ".mcp.json",
     "hooks",
     "launcher",
+    "native",
     "README.md",
     "LICENSE"
   ],
   "optionalDependencies": {
-    "@pty-bridge/darwin-arm64": "0.1.0",
-    "@pty-bridge/darwin-x64": "0.1.0",
-    "@pty-bridge/linux-arm64": "0.1.0",
-    "@pty-bridge/linux-x64": "0.1.0",
-    "@pty-bridge/win32-arm64": "0.1.0",
-    "@pty-bridge/win32-x64": "0.1.0"
+    "@pty-bridge/darwin-arm64": "0.1.1",
+    "@pty-bridge/darwin-x64": "0.1.1",
+    "@pty-bridge/linux-arm64": "0.1.1",
+    "@pty-bridge/linux-x64": "0.1.1",
+    "@pty-bridge/win32-arm64": "0.1.1",
+    "@pty-bridge/win32-x64": "0.1.1"
   },
   "publishConfig": {
     "access": "public",

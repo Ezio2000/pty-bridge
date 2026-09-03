@@ -22,12 +22,17 @@ function resolveBinary() {
   if (!supported.has(target)) {
     throw new Error(`Unsupported platform: ${target}`);
   }
+  const binaryName = process.platform === 'win32' ? 'pty-bridge.exe' : 'pty-bridge';
+  const bundled = path.resolve(__dirname, '..', 'native', target, binaryName);
+  if (fs.existsSync(bundled)) {
+    return bundled;
+  }
   const packageName = `@pty-bridge/${target}`;
   try {
     const manifest = require.resolve(`${packageName}/package.json`);
-    return path.join(path.dirname(manifest), 'bin', process.platform === 'win32' ? 'pty-bridge.exe' : 'pty-bridge');
+    return path.join(path.dirname(manifest), 'bin', binaryName);
   } catch (error) {
-    const local = path.resolve(__dirname, '..', '..', '..', 'target', 'debug', process.platform === 'win32' ? 'pty-bridge.exe' : 'pty-bridge');
+    const local = path.resolve(__dirname, '..', '..', '..', 'target', 'debug', binaryName);
     if (fs.existsSync(local)) return local;
     throw new Error(`Native package ${packageName} is missing. Reinstall @pty-bridge/plugin for ${target}.`, { cause: error });
   }

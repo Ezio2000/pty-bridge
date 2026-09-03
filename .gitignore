@@ -8,6 +8,7 @@ coverage/
 *.log
 *.tgz
 /packages/*/bin/
+/packages/plugin/native/
 
 # Environment / secrets
 .env

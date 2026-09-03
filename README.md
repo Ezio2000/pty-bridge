@@ -39,7 +39,7 @@ There is no tmux server, daemon, plugin skill, or model-visible credential. The 
 
 ## Install
 
-Published installations use the plugin package and one optional native package selected by npm:
+Published installations use the plugin package. It contains all six native binaries because Claude Code's npm plugin cache does not retain dependency directories; regular npm installs can also use the matching optional native package:
 
 ```sh
 npm install @pty-bridge/plugin
