@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "pty-bridge",
+  "version": "0.1.0",
+  "description": "Cross-platform interactive PTY sessions with background monitoring",
+  "author": {
+    "name": "ezio2000"
+  },
+  "repository": "https://github.com/Ezio2000/pty-bridge",
+  "license": "Apache-2.0",
+  "keywords": ["pty", "terminal", "mcp", "interactive", "cross-platform"]
+}

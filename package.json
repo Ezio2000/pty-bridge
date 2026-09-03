@@ -1,0 +1,15 @@
+{
+  "name": "pty-bridge-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "check": "node scripts/check-packages.cjs",
+    "test": "npm run check && cargo test --workspace",
+    "pack:plugin": "npm pack --workspace @pty-bridge/plugin",
+    "stage:native": "node scripts/stage-native.cjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

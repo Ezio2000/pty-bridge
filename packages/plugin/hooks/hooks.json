@@ -1,0 +1,30 @@
+{
+  "description": "Bind PTY ownership and clean up sessions when the host session ends",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "mcp__pty__start",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/launcher/launch.cjs", "hook", "bind"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/launcher/launch.cjs", "hook", "cleanup"],
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

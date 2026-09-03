@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "pty-bridge",
+  "description": "Interactive cross-platform PTY support for coding agents",
+  "owner": {
+    "name": "ezio2000"
+  },
+  "plugins": [
+    {
+      "name": "pty-bridge",
+      "description": "Cross-platform interactive PTY sessions with background monitoring",
+      "source": {
+        "source": "npm",
+        "package": "@pty-bridge/plugin"
+      },
+      "category": "development",
+      "tags": ["pty", "terminal", "mcp"]
+    }
+  ]
+}

@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.package }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            package: darwin-arm64
+            binary: target/aarch64-apple-darwin/release/pty-bridge
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            package: darwin-x64
+            binary: target/x86_64-apple-darwin/release/pty-bridge
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            package: linux-arm64
+            binary: target/aarch64-unknown-linux-musl/release/pty-bridge
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            package: linux-x64
+            binary: target/x86_64-unknown-linux-musl/release/pty-bridge
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            package: win32-arm64
+            binary: target/aarch64-pc-windows-msvc/release/pty-bridge.exe
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            package: win32-x64
+            binary: target/x86_64-pc-windows-msvc/release/pty-bridge.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Install musl toolchain
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --workspace --release --locked --target ${{ matrix.target }}
+      - run: node scripts/stage-native.cjs ${{ matrix.package }} ${{ matrix.binary }}
+      - uses: actions/upload-artifact@v5
+        with:
+          name: native-${{ matrix.package }}
+          path: packages/${{ matrix.package }}/bin/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: native-*
+          path: artifacts
+      - name: Check tag and package versions
+        if: github.ref_type == 'tag'
+        run: |
+          test "${GITHUB_REF_NAME#v}" = "$(node -p "require('./packages/plugin/package.json').version")"
+          node scripts/check-packages.cjs
+      - name: Stage package contents
+        run: |
+          for target in darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-arm64 win32-x64; do
+            binary=pty-bridge
+            case "$target" in win32-*) binary=pty-bridge.exe;; esac
+            node scripts/stage-native.cjs "$target" "artifacts/native-$target/$binary"
+          done
+          cp LICENSE packages/plugin/LICENSE
+      - name: Inspect package tarballs
+        run: |
+          for target in darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-arm64 win32-x64 plugin; do
+            npm pack "./packages/$target" --dry-run
+          done
+      - name: Publish native packages
+        run: |
+          for target in darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-arm64 win32-x64; do
+            npm publish "./packages/$target" --access public
+          done
+      - name: Publish plugin
+        run: npm publish ./packages/plugin --access public
