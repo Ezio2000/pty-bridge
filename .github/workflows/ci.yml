@@ -37,4 +37,4 @@ jobs:
         with:
           node-version: "24"
           package-manager-cache: false
-      - run: npx --yes @anthropic-ai/claude-code@2.1.259 plugin validate packages/plugin
+      - run: npx --yes @anthropic-ai/claude-code@latest plugin validate packages/plugin
