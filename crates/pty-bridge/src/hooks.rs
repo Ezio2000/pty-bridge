@@ -9,10 +9,10 @@ use tokio::{
     task::JoinSet,
 };
 
-use crate::runtime::{self, Ownership, OwnershipEntry};
+use crate::runtime::{self, Ownership, OwnershipEntry, ProcessLocator};
 
-const CONTROL_TIMEOUT: Duration = Duration::from_millis(500);
-const CLEANUP_DEADLINE: Duration = Duration::from_millis(600);
+const CONTROL_TIMEOUT: Duration = Duration::from_millis(250);
+const CLEANUP_DEADLINE: Duration = Duration::from_millis(750);
 
 #[derive(Debug, Deserialize)]
 struct HookInput {
@@ -62,7 +62,7 @@ pub async fn cleanup_from_stdin() -> Result<()> {
         while let Some(result) = tasks.join_next().await {
             match result {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => errors.push(error.to_string()),
+                Ok(Err(error)) => errors.push(format!("{error:#}")),
                 Err(error) => errors.push(error.to_string()),
             }
         }
@@ -84,27 +84,103 @@ pub async fn cleanup_from_stdin() -> Result<()> {
 
 async fn cleanup_entry(entry: OwnershipEntry) -> Result<()> {
     let record = &entry.record;
-    match runtime::read_control(&record.instance_id, &record.session_id) {
-        Ok(control) => {
-            send_control(
-                record.port,
-                serde_json::json!({
-                    "action": "finish_owned",
-                    "instance_id": record.instance_id,
-                    "session_id": record.session_id,
-                    "token": control.token,
-                }),
-            )
-            .await
-            .with_context(|| format!("finish {}", record.session_id))?;
-            runtime::remove_ownership_entry(&entry);
-            Ok(())
-        }
-        Err(error) if runtime::is_not_found(&error) => {
-            runtime::remove_ownership_entry(&entry);
-            Ok(())
-        }
+    let control_result = match runtime::read_control(&record.instance_id, &record.session_id) {
+        Ok(control) => send_control(
+            record.port,
+            serde_json::json!({
+                "action": "finish_owned",
+                "instance_id": record.instance_id,
+                "session_id": record.session_id,
+                "token": control.token,
+            }),
+        )
+        .await
+        .with_context(|| format!("finish {}", record.session_id)),
         Err(error) => Err(error).with_context(|| format!("read control for {}", record.session_id)),
+    };
+    if let Err(control_error) = control_result {
+        let locator = runtime::read_process_locator(&entry)
+            .with_context(|| format!("locate process for {}", record.session_id))?;
+        if let Some(locator) = locator {
+            terminate_process(&locator).with_context(|| {
+                format!(
+                    "directly finish {} after control failure ({control_error:#})",
+                    record.session_id
+                )
+            })?;
+        }
+    }
+    runtime::remove_session_credentials(&record.instance_id, &record.session_id);
+    runtime::remove_ownership_entry(&entry);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn terminate_process(locator: &ProcessLocator) -> Result<()> {
+    let ProcessLocator::Unix {
+        process_id,
+        process_group,
+    } = locator
+    else {
+        bail!("process locator does not match this platform");
+    };
+    if let Some(group) = process_group {
+        if *group <= 0 {
+            bail!("invalid process group in ownership record");
+        }
+        if unsafe { libc::kill(-group, libc::SIGKILL) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error).context("kill owned process group")
+        };
+    }
+    if *process_id <= 0 {
+        bail!("invalid process id in ownership record");
+    }
+    if unsafe { libc::kill(*process_id, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error).context("kill owned process")
+    }
+}
+
+#[cfg(windows)]
+fn terminate_process(locator: &ProcessLocator) -> Result<()> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND},
+        System::{
+            JobObjects::{OpenJobObjectW, TerminateJobObject},
+            SystemServices::JOB_OBJECT_TERMINATE,
+        },
+    };
+
+    let ProcessLocator::WindowsJob { name } = locator else {
+        bail!("process locator does not match this platform");
+    };
+    let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let job = unsafe { OpenJobObjectW(JOB_OBJECT_TERMINATE, 0, wide_name.as_ptr()) };
+    if job.is_null() {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
+            Ok(())
+        } else {
+            Err(error).context("open owned job object")
+        };
+    }
+    let terminated = unsafe { TerminateJobObject(job, 1) };
+    unsafe { CloseHandle(job) };
+    if terminated == 0 {
+        Err(std::io::Error::last_os_error()).context("terminate owned job object")
+    } else {
+        Ok(())
     }
 }
 

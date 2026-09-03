@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::{
     MAX_SESSIONS, OUTPUT_CAPACITY,
     buffer::{BufferRead, OutputBuffer},
-    runtime::{self, BackgroundTaskTicket, ControlRecord},
+    runtime::{self, BackgroundTaskTicket, ControlRecord, ProcessLocator},
 };
 
 const MAX_HANDSHAKE_BYTES: usize = 16 * 1024;
@@ -123,6 +123,25 @@ struct PtyResources {
     process_id: Option<i32>,
 }
 
+impl PtyResources {
+    #[cfg(unix)]
+    fn process_locator(&self) -> Result<ProcessLocator> {
+        Ok(ProcessLocator::Unix {
+            process_id: self
+                .process_id
+                .ok_or_else(|| anyhow!("PTY child has no process id"))?,
+            process_group: self.process_group,
+        })
+    }
+
+    #[cfg(windows)]
+    fn process_locator(&self) -> Result<ProcessLocator> {
+        Ok(ProcessLocator::WindowsJob {
+            name: self.job.name.clone(),
+        })
+    }
+}
+
 struct PtySetup {
     master: Box<dyn MasterPty + Send>,
     reader: Box<dyn Read + Send>,
@@ -138,6 +157,25 @@ struct PtySetup {
     process_group: Option<i32>,
     #[cfg(unix)]
     process_id: Option<i32>,
+}
+
+impl PtySetup {
+    #[cfg(unix)]
+    fn process_locator(&self) -> Result<ProcessLocator> {
+        Ok(ProcessLocator::Unix {
+            process_id: self
+                .process_id
+                .ok_or_else(|| anyhow!("PTY child has no process id"))?,
+            process_group: self.process_group,
+        })
+    }
+
+    #[cfg(windows)]
+    fn process_locator(&self) -> Result<ProcessLocator> {
+        Ok(ProcessLocator::WindowsJob {
+            name: self.job.name.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -528,6 +566,8 @@ impl Manager {
     async fn start_session(self: &Arc<Self>, session_id: &str) -> Result<()> {
         let session = self.get(session_id)?;
         let session_for_setup = session.clone();
+        let setup_instance_id = self.instance_id.clone();
+        let setup_session_id = session_id.to_owned();
         let setup = tokio::task::spawn_blocking(move || -> Result<PtySetup> {
             let pty_system = native_pty_system();
             let pair = pty_system.openpty(PtySize {
@@ -543,7 +583,7 @@ impl Manager {
                 cmd.env(key, value);
             }
             let child = pair.slave.spawn_command(cmd)?;
-            let job = assign_job(child.as_ref())?;
+            let job = assign_job(child.as_ref(), &setup_instance_id, &setup_session_id)?;
             drop(pair.slave);
             let reader = pair.master.try_clone_reader()?;
             let writer = pair.master.take_writer()?;
@@ -583,6 +623,16 @@ impl Manager {
                 stop_setup(&mut setup);
                 let _ = setup.child.wait();
                 return Ok(());
+            }
+            if let Some(owner) = lifecycle.owner.as_deref()
+                && let Err(error) = setup.process_locator().and_then(|locator| {
+                    runtime::write_process_locator(owner, &self.instance_id, session_id, &locator)
+                })
+            {
+                drop(lifecycle);
+                stop_setup(&mut setup);
+                let _ = setup.child.wait();
+                return Err(error).context("register owned PTY process");
             }
             lifecycle.resources = Some(PtyResources {
                 writer: setup.writer,
@@ -920,6 +970,15 @@ impl Manager {
         if lifecycle.state == SessionState::Finished {
             bail!("session already finished");
         }
+        if let Some(resources) = lifecycle.resources.as_ref() {
+            runtime::write_process_locator(
+                host_session_id,
+                &self.instance_id,
+                session_id,
+                &resources.process_locator()?,
+            )
+            .context("register owned PTY process")?;
+        }
         lifecycle.owner = Some(host_session_id.to_string());
         Ok(())
     }
@@ -1004,8 +1063,7 @@ impl Manager {
             .lock()
             .expect("control tokens poisoned")
             .remove(session_id);
-        runtime::remove_background_task_ticket(&self.instance_id, session_id);
-        runtime::remove_control(&self.instance_id, session_id);
+        runtime::remove_session_credentials(&self.instance_id, session_id);
     }
 
     fn rollback_create(&self, session_id: &str) {
@@ -1019,7 +1077,10 @@ impl Manager {
 
 #[cfg(windows)]
 #[derive(Debug)]
-struct KillJob(isize);
+struct KillJob {
+    handle: isize,
+    name: String,
+}
 
 #[cfg(windows)]
 type PlatformJob = KillJob;
@@ -1031,18 +1092,18 @@ struct NoopJob;
 type PlatformJob = NoopJob;
 
 #[cfg(windows)]
-fn assign_job(child: &dyn Child) -> Result<PlatformJob> {
-    KillJob::assign(child)
+fn assign_job(child: &dyn Child, instance_id: &str, session_id: &str) -> Result<PlatformJob> {
+    KillJob::assign(child, instance_id, session_id)
 }
 
 #[cfg(not(windows))]
-fn assign_job(_child: &dyn Child) -> Result<PlatformJob> {
+fn assign_job(_child: &dyn Child, _instance_id: &str, _session_id: &str) -> Result<PlatformJob> {
     Ok(NoopJob)
 }
 
 #[cfg(windows)]
 impl KillJob {
-    fn assign(child: &dyn Child) -> Result<Self> {
+    fn assign(child: &dyn Child, instance_id: &str, session_id: &str) -> Result<Self> {
         use std::{ffi::c_void, mem::size_of, ptr::null};
         use windows_sys::Win32::{
             Foundation::{CloseHandle, HANDLE},
@@ -1053,7 +1114,9 @@ impl KillJob {
             },
         };
 
-        let job = unsafe { CreateJobObjectW(null(), null()) };
+        let name = format!("Local\\pty-bridge-{instance_id}-{session_id}");
+        let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let job = unsafe { CreateJobObjectW(null(), wide_name.as_ptr()) };
         if job.is_null() {
             return Err(std::io::Error::last_os_error().into());
         }
@@ -1085,12 +1148,12 @@ impl KillJob {
             unsafe { CloseHandle(job) };
             return Err(error);
         }
-        Ok(Self(raw))
+        Ok(Self { handle: raw, name })
     }
 
     fn terminate(&self) -> Result<()> {
         use windows_sys::Win32::{Foundation::HANDLE, System::JobObjects::TerminateJobObject};
-        if unsafe { TerminateJobObject(self.0 as HANDLE, 1) } == 0 {
+        if unsafe { TerminateJobObject(self.handle as HANDLE, 1) } == 0 {
             return Err(std::io::Error::last_os_error().into());
         }
         Ok(())
@@ -1101,7 +1164,7 @@ impl KillJob {
 impl Drop for KillJob {
     fn drop(&mut self) {
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-        unsafe { CloseHandle(self.0 as HANDLE) };
+        unsafe { CloseHandle(self.handle as HANDLE) };
     }
 }
 

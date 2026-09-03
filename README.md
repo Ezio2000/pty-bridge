@@ -25,6 +25,8 @@ LLM -> MCP read/write/resize/signal/status
 PostToolUse hook -> bind host-session ownership
 natural exit     -> automatically finalize and remove credentials
 SessionEnd hook  -> finish any session still active
+                    via MCP control, or directly via the recorded
+                    Unix process group / Windows named Job Object
 ```
 
 MCP instructions, tool descriptions, and structured `next_action` values contain the complete orchestration contract. No Skill is installed or required. Lifecycle correctness is enforced by the native state machine rather than model compliance.
@@ -70,7 +72,8 @@ Output is retained in a bounded 1 MiB ring per session. Up to 64 active or retai
 - Runtime directories use mode `0700` and files use `0600` on Unix. Windows uses the current user's LocalAppData ACL.
 - Natural exit, start failure, ticket expiry, explicit close, Background Task disconnect, host SessionEnd, and MCP shutdown all converge on one finalization path.
 - Finalization removes credentials automatically while retaining bounded output and the termination result.
-- Windows force termination uses a Job Object; Unix force termination targets the PTY process group.
+- SessionEnd remains effective when Claude Code has already torn down the MCP server: the hook falls back to the private process locator, terminates the Unix process group or named Windows Job Object directly, and removes stale credentials.
+- Windows force termination uses a named Job Object; Unix force termination targets the PTY process group.
 
 ## Development
 

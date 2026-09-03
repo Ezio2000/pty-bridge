@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::{
     io::Write,
     process::{Command, Stdio},
@@ -5,6 +7,8 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
+use pty_bridge::runtime::{BackgroundTaskTicket, ControlRecord, Ownership, ProcessLocator};
 use pty_bridge::{
     MAX_SESSIONS, background_task,
     manager::{FinishReason, Manager, SessionState, StartSpec, default_spec},
@@ -263,6 +267,69 @@ async fn session_end_hook_finishes_owned_session() {
     let scan = runtime::read_ownership(&host_session).unwrap();
     assert!(scan.entries.is_empty());
     assert!(scan.errors.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn session_end_hook_kills_process_group_when_control_server_is_gone() {
+    let host_session = format!("host_{}", uuid::Uuid::new_v4().simple());
+    let instance_id = format!("inst_{}", uuid::Uuid::new_v4().simple());
+    let session_id = format!("pty_{}", uuid::Uuid::new_v4().simple());
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "trap '' HUP TERM; sleep 30"])
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let process_id = i32::try_from(child.id()).unwrap();
+    runtime::write_ownership(&Ownership {
+        host_session_id: host_session.clone(),
+        instance_id: instance_id.clone(),
+        session_id: session_id.clone(),
+        port,
+    })
+    .unwrap();
+    runtime::write_process_locator(
+        &host_session,
+        &instance_id,
+        &session_id,
+        &ProcessLocator::Unix {
+            process_id,
+            process_group: Some(process_id),
+        },
+    )
+    .unwrap();
+    let control_path = runtime::runtime_root_path()
+        .unwrap()
+        .join(&instance_id)
+        .join(format!("{session_id}.control"));
+    runtime::write_control(&ControlRecord {
+        instance_id: instance_id.clone(),
+        session_id: session_id.clone(),
+        port,
+        token: "test-control-token".into(),
+    })
+    .unwrap();
+    let ticket_path = runtime::write_background_task_ticket(&BackgroundTaskTicket {
+        instance_id: instance_id.clone(),
+        session_id: session_id.clone(),
+        port,
+        token: "test-background-token".into(),
+        expires_at_ms: runtime::now_ms() + 60_000,
+    })
+    .unwrap();
+
+    run_hook("cleanup", serde_json::json!({ "session_id": host_session }));
+    let status = child.wait().unwrap();
+    assert!(!status.success());
+    let scan = runtime::read_ownership(&host_session).unwrap();
+    assert!(scan.entries.is_empty());
+    assert!(scan.errors.is_empty());
+    assert!(!control_path.exists());
+    assert!(!ticket_path.exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

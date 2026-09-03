@@ -27,6 +27,18 @@ pub struct Ownership {
     pub port: u16,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProcessLocator {
+    Unix {
+        process_id: i32,
+        process_group: Option<i32>,
+    },
+    WindowsJob {
+        name: String,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct OwnershipEntry {
     pub record: Ownership,
@@ -163,6 +175,20 @@ pub fn remove_control(instance_id: &str, session_id: &str) {
     }
 }
 
+pub fn remove_session_credentials(instance_id: &str, session_id: &str) {
+    remove_background_task_ticket(instance_id, session_id);
+    remove_control(instance_id, session_id);
+    let Ok(path) = instance_path(instance_id) else {
+        return;
+    };
+    let is_empty = fs::read_dir(&path)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false);
+    if is_empty {
+        let _ = fs::remove_dir(path);
+    }
+}
+
 fn ownership_dir_path(host_session_id: &str) -> Result<PathBuf> {
     validate_id(host_session_id)?;
     Ok(runtime_root_path()?.join("owners").join(host_session_id))
@@ -172,6 +198,16 @@ fn ownership_path(host_session_id: &str, instance_id: &str, session_id: &str) ->
     validate_id(instance_id)?;
     validate_id(session_id)?;
     Ok(ownership_dir_path(host_session_id)?.join(format!("{instance_id}--{session_id}.json")))
+}
+
+fn process_locator_path(
+    host_session_id: &str,
+    instance_id: &str,
+    session_id: &str,
+) -> Result<PathBuf> {
+    validate_id(instance_id)?;
+    validate_id(session_id)?;
+    Ok(ownership_dir_path(host_session_id)?.join(format!("{instance_id}--{session_id}.process")))
 }
 
 pub fn write_ownership(record: &Ownership) -> Result<()> {
@@ -184,6 +220,33 @@ pub fn write_ownership(record: &Ownership) -> Result<()> {
         record.instance_id, record.session_id
     ));
     write_private_json_new(&path, record).context("create ownership record")
+}
+
+pub fn write_process_locator(
+    host_session_id: &str,
+    instance_id: &str,
+    session_id: &str,
+    locator: &ProcessLocator,
+) -> Result<()> {
+    let path = process_locator_path(host_session_id, instance_id, session_id)?;
+    write_private_json_new(&path, locator).context("create private process locator")
+}
+
+pub fn read_process_locator(entry: &OwnershipEntry) -> Result<Option<ProcessLocator>> {
+    let record = &entry.record;
+    let path = process_locator_path(
+        &record.host_session_id,
+        &record.instance_id,
+        &record.session_id,
+    )?;
+    let data = match fs::read(&path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("read process locator"),
+    };
+    serde_json::from_slice(&data)
+        .map(Some)
+        .context("parse process locator")
 }
 
 pub fn read_ownership(host_session_id: &str) -> Result<OwnershipScan> {
@@ -249,11 +312,21 @@ pub fn remove_ownership_record(host_session_id: &str, instance_id: &str, session
     if let Ok(path) = ownership_path(host_session_id, instance_id, session_id) {
         let _ = fs::remove_file(path);
     }
+    if let Ok(path) = process_locator_path(host_session_id, instance_id, session_id) {
+        let _ = fs::remove_file(path);
+    }
     remove_empty_ownership_dir(host_session_id);
 }
 
 pub fn remove_ownership_entry(entry: &OwnershipEntry) {
     let _ = fs::remove_file(&entry.path);
+    if let Ok(path) = process_locator_path(
+        &entry.record.host_session_id,
+        &entry.record.instance_id,
+        &entry.record.session_id,
+    ) {
+        let _ = fs::remove_file(path);
+    }
     remove_empty_ownership_dir(&entry.record.host_session_id);
 }
 
@@ -267,13 +340,6 @@ fn remove_empty_ownership_dir(host_session_id: &str) {
     if is_empty {
         let _ = fs::remove_dir(dir);
     }
-}
-
-pub fn is_not_found(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
-        .is_some_and(|error| error.kind() == ErrorKind::NotFound)
 }
 
 pub fn validate_id(value: &str) -> Result<()> {

@@ -1,6 +1,6 @@
 {
   "name": "@pty-bridge/plugin",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Cross-platform interactive PTY plugin",
   "license": "Apache-2.0",
   "repository": {
