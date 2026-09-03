@@ -637,16 +637,36 @@ impl Manager {
             .name("pty-child-wait".into())
             .spawn(move || {
                 let status = child.wait();
-                let read_error = reader_thread
-                    .join()
-                    .ok()
-                    .flatten()
-                    .map(|error| format!("terminal read failed: {error}"));
                 if let Some(manager) = manager.upgrade() {
+                    // ConPTY does not necessarily close the cloned reader while its master
+                    // handle remains alive. Release the terminal handles after the child has
+                    // exited, then let the reader drain everything already buffered before
+                    // publishing the terminal event.
+                    manager.release_resources_after_child_exit(&wait_id);
+                    let read_error = reader_thread
+                        .join()
+                        .ok()
+                        .flatten()
+                        .map(|error| format!("terminal read failed: {error}"));
                     manager.child_finished(&wait_id, status, read_error);
+                } else {
+                    let _ = reader_thread.join();
                 }
             })?;
         Ok(())
+    }
+
+    fn release_resources_after_child_exit(&self, session_id: &str) {
+        let Ok(session) = self.get(session_id) else {
+            return;
+        };
+        let resources = session
+            .lifecycle
+            .lock()
+            .expect("session lifecycle poisoned")
+            .resources
+            .take();
+        drop(resources);
     }
 
     fn child_finished(
