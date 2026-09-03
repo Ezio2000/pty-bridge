@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "pty-bridge",
-      "description": "Cross-platform interactive PTY sessions with background monitoring",
+      "description": "Cross-platform interactive PTY sessions with a live Background Task",
       "source": {
         "source": "npm",
         "package": "@pty-bridge/plugin"

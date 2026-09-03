@@ -7,8 +7,8 @@ use std::{
 };
 
 use pty_bridge::{
+    background_task,
     manager::{Manager, SessionState, default_spec},
-    watcher,
 };
 
 async fn wait_for_output(manager: &Manager, session_id: &str, needle: &str) -> String {
@@ -28,10 +28,12 @@ async fn wait_for_output(manager: &Manager, session_id: &str, needle: &str) -> S
 async fn interactive_session_is_a_real_tty() {
     let manager = Manager::new().await.unwrap();
     let spec = default_spec("/bin/sh".into(), vec![], std::env::current_dir().unwrap());
-    let (session_id, watch) = manager
-        .create(spec, false, Duration::from_secs(30))
-        .unwrap();
-    assert!(watch.is_none());
+    let (session_id, _) = manager.create(spec, Duration::from_secs(30)).unwrap();
+
+    let instance_id = manager.instance_id().to_string();
+    let attached_id = session_id.clone();
+    let background =
+        tokio::spawn(async move { background_task::run(&instance_id, &attached_id).await });
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while manager.state(&session_id).unwrap() != SessionState::Running {
@@ -47,29 +49,56 @@ async fn interactive_session_is_a_real_tty() {
     let output = wait_for_output(&manager, &session_id, "PTY_OK").await;
     assert!(output.contains("PTY_OK"));
     manager.close(&session_id).unwrap();
+    background.await.unwrap().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn monitored_session_starts_after_watcher_authentication() {
+async fn session_starts_after_background_task_attachment() {
     let manager = Manager::new().await.unwrap();
     let spec = default_spec(
         "/bin/sh".into(),
-        vec!["-c".into(), "printf MONITORED_OK".into()],
+        vec!["-c".into(), "printf BACKGROUND_TASK_OK".into()],
         std::env::current_dir().unwrap(),
     );
-    let (session_id, watch) = manager.create(spec, true, Duration::from_secs(30)).unwrap();
-    assert!(watch.is_some());
+    let (session_id, command) = manager.create(spec, Duration::from_secs(30)).unwrap();
+    assert!(command.contains("background-task"));
     assert_eq!(
         manager.state(&session_id).unwrap(),
-        SessionState::PendingMonitor
+        SessionState::AwaitingBackgroundTask
     );
 
     let instance_id = manager.instance_id().to_string();
-    let watched_id = session_id.clone();
-    let watcher = tokio::spawn(async move { watcher::run(&instance_id, &watched_id).await });
-    let output = wait_for_output(&manager, &session_id, "MONITORED_OK").await;
-    assert!(output.contains("MONITORED_OK"));
-    watcher.await.unwrap().unwrap();
+    let attached_id = session_id.clone();
+    let background =
+        tokio::spawn(async move { background_task::run(&instance_id, &attached_id).await });
+    let output = wait_for_output(&manager, &session_id, "BACKGROUND_TASK_OK").await;
+    assert!(output.contains("BACKGROUND_TASK_OK"));
+    background.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_task_disconnect_closes_session() {
+    let manager = Manager::new().await.unwrap();
+    let spec = default_spec(
+        "/bin/sh".into(),
+        vec!["-c".into(), "printf READY; sleep 30".into()],
+        std::env::current_dir().unwrap(),
+    );
+    let (session_id, _) = manager.create(spec, Duration::from_secs(30)).unwrap();
+    let instance_id = manager.instance_id().to_string();
+    let attached_id = session_id.clone();
+    let background =
+        tokio::spawn(async move { background_task::run(&instance_id, &attached_id).await });
+    wait_for_output(&manager, &session_id, "READY").await;
+
+    background.abort();
+    assert!(background.await.unwrap_err().is_cancelled());
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while manager.state(&session_id).unwrap() != SessionState::Closed {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 fn run_hook(command: &str, input: serde_json::Value) {
@@ -91,9 +120,11 @@ fn run_hook(command: &str, input: serde_json::Value) {
 async fn session_end_hook_closes_owned_session() {
     let manager = Manager::new().await.unwrap();
     let spec = default_spec("/bin/sh".into(), vec![], std::env::current_dir().unwrap());
-    let (session_id, _) = manager
-        .create(spec, false, Duration::from_secs(30))
-        .unwrap();
+    let (session_id, _) = manager.create(spec, Duration::from_secs(30)).unwrap();
+    let instance_id = manager.instance_id().to_string();
+    let attached_id = session_id.clone();
+    let background =
+        tokio::spawn(async move { background_task::run(&instance_id, &attached_id).await });
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while manager.state(&session_id).unwrap() != SessionState::Running {
         assert!(tokio::time::Instant::now() < deadline);
@@ -121,4 +152,5 @@ async fn session_end_hook_closes_owned_session() {
         assert!(tokio::time::Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    background.await.unwrap().unwrap();
 }

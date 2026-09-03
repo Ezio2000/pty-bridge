@@ -20,13 +20,13 @@ use uuid::Uuid;
 use crate::{
     DEFAULT_COLS, DEFAULT_ROWS, MAX_SESSIONS, OUTPUT_CAPACITY,
     buffer::{BufferRead, OutputBuffer},
-    runtime::{self, ControlRecord, Ticket},
+    runtime::{self, BackgroundTaskTicket, ControlRecord},
 };
 
 #[derive(Debug, Clone, Copy, Serialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionState {
-    PendingMonitor,
+    AwaitingBackgroundTask,
     Starting,
     Running,
     Exited,
@@ -67,7 +67,6 @@ struct SessionMeta {
     cols: u16,
     last_activity_ms: u64,
     exit_code: Option<u32>,
-    monitor_connected: bool,
 }
 
 struct Session {
@@ -95,7 +94,6 @@ impl Session {
                 cols: spec.cols,
                 last_activity_ms: runtime::now_ms(),
                 exit_code: None,
-                monitor_connected: false,
             }),
             spec,
             output: Mutex::new(OutputBuffer::new(OUTPUT_CAPACITY)),
@@ -143,7 +141,7 @@ pub struct Manager {
     instance_id: String,
     port: u16,
     sessions: RwLock<HashMap<String, Arc<Session>>>,
-    tickets: Mutex<HashMap<String, String>>,
+    background_task_tickets: Mutex<HashMap<String, String>>,
     control_tokens: Mutex<HashMap<String, String>>,
 }
 
@@ -155,7 +153,7 @@ impl Manager {
             instance_id: format!("inst_{}", Uuid::new_v4().simple()),
             port,
             sessions: RwLock::new(HashMap::new()),
-            tickets: Mutex::new(HashMap::new()),
+            background_task_tickets: Mutex::new(HashMap::new()),
             control_tokens: Mutex::new(HashMap::new()),
         });
         let weak = Arc::downgrade(&manager);
@@ -168,8 +166,8 @@ impl Manager {
                     break;
                 };
                 tokio::spawn(async move {
-                    if let Err(error) = manager.handle_watcher(stream).await {
-                        tracing::debug!(%error, "watcher connection ended");
+                    if let Err(error) = manager.handle_connection(stream).await {
+                        tracing::debug!(%error, "background task connection ended");
                     }
                 });
             }
@@ -188,9 +186,8 @@ impl Manager {
     pub fn create(
         self: &Arc<Self>,
         spec: StartSpec,
-        monitor_required: bool,
         ticket_ttl: Duration,
-    ) -> Result<(String, Option<String>)> {
+    ) -> Result<(String, String)> {
         self.prune_exited();
         if self.sessions.read().expect("sessions poisoned").len() >= MAX_SESSIONS {
             bail!("session limit reached ({MAX_SESSIONS})");
@@ -198,16 +195,13 @@ impl Manager {
         if !spec.cwd.is_dir() {
             bail!("working directory does not exist: {}", spec.cwd.display());
         }
-        let executable = monitor_required
-            .then(|| std::env::current_exe().context("resolve pty-bridge executable"))
-            .transpose()?;
+        let executable = std::env::current_exe().context("resolve pty-bridge executable")?;
         let session_id = format!("pty_{}", Uuid::new_v4().simple());
-        let state = if monitor_required {
-            SessionState::PendingMonitor
-        } else {
-            SessionState::Starting
-        };
-        let session = Arc::new(Session::new(session_id.clone(), spec, state));
+        let session = Arc::new(Session::new(
+            session_id.clone(),
+            spec,
+            SessionState::AwaitingBackgroundTask,
+        ));
         self.sessions
             .write()
             .expect("sessions poisoned")
@@ -228,58 +222,46 @@ impl Manager {
             return Err(error);
         }
 
-        let watch_command = if monitor_required {
-            let token = random_token();
-            self.tickets
-                .lock()
-                .expect("tickets poisoned")
-                .insert(session_id.clone(), token.clone());
-            let ticket = Ticket {
-                instance_id: self.instance_id.clone(),
-                session_id: session_id.clone(),
-                port: self.port,
-                token,
-                expires_at_ms: runtime::now_ms() + ticket_ttl.as_millis() as u64,
-            };
-            if let Err(error) = runtime::write_ticket(&ticket) {
-                self.rollback_create(&session_id);
-                return Err(error);
-            }
-            let weak = Arc::downgrade(self);
-            let expiry_id = session_id.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(ticket_ttl).await;
-                if let Some(manager) = weak.upgrade() {
-                    manager.expire_pending(&expiry_id);
-                }
-            });
-            let executable = executable.expect("resolved for monitored session");
-            Some(format!(
-                "\"{}\" watch --instance {} --session {}",
-                executable.display(),
-                self.instance_id,
-                session_id
-            ))
-        } else {
-            let manager = Arc::clone(self);
-            let id = session_id.clone();
-            tokio::spawn(async move {
-                if let Err(error) = manager.start_session(&id).await {
-                    manager.fail_session(&id, &error.to_string());
-                }
-            });
-            None
+        let token = random_token();
+        self.background_task_tickets
+            .lock()
+            .expect("background task tickets poisoned")
+            .insert(session_id.clone(), token.clone());
+        let ticket = BackgroundTaskTicket {
+            instance_id: self.instance_id.clone(),
+            session_id: session_id.clone(),
+            port: self.port,
+            token,
+            expires_at_ms: runtime::now_ms() + ticket_ttl.as_millis() as u64,
         };
-        Ok((session_id, watch_command))
+        if let Err(error) = runtime::write_background_task_ticket(&ticket) {
+            self.rollback_create(&session_id);
+            return Err(error);
+        }
+        let weak = Arc::downgrade(self);
+        let expiry_id = session_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(ticket_ttl).await;
+            if let Some(manager) = weak.upgrade() {
+                manager.expire_pending(&expiry_id);
+            }
+        });
+        let background_task_command = format!(
+            "\"{}\" background-task --instance {} --session {}",
+            executable.display(),
+            self.instance_id,
+            session_id
+        );
+        Ok((session_id, background_task_command))
     }
 
-    async fn handle_watcher(self: Arc<Self>, stream: TcpStream) -> Result<()> {
+    async fn handle_connection(self: Arc<Self>, stream: TcpStream) -> Result<()> {
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
         let mut line = String::new();
         tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
             .await
-            .context("watcher handshake timeout")??;
+            .context("connection handshake timeout")??;
         let value: serde_json::Value = serde_json::from_str(line.trim())?;
         if value.get("action").and_then(|v| v.as_str()) == Some("cleanup") {
             let request: CleanupRequest = serde_json::from_value(value)?;
@@ -300,31 +282,33 @@ impl Manager {
             write_half.write_all(b"{\"ok\":true}\n").await?;
             return Ok(());
         }
-        let request: WatchRequest = serde_json::from_value(value)?;
+        let request: BackgroundTaskRequest = serde_json::from_value(value)?;
+        if request.action != "attach_background_task" {
+            bail!("unsupported action");
+        }
         if request.instance_id != self.instance_id {
             bail!("instance mismatch");
         }
         let expected = self
-            .tickets
+            .background_task_tickets
             .lock()
-            .expect("tickets poisoned")
+            .expect("background task tickets poisoned")
             .remove(&request.session_id)
-            .ok_or_else(|| anyhow!("watch ticket not found or already consumed"))?;
+            .ok_or_else(|| anyhow!("background task ticket not found or already consumed"))?;
         if expected != request.token {
-            bail!("watch ticket rejected");
+            bail!("background task ticket rejected");
         }
-        runtime::remove_ticket(&self.instance_id, &request.session_id);
+        runtime::remove_background_task_ticket(&self.instance_id, &request.session_id);
         let session = self.get(&request.session_id)?;
         {
             let mut meta = session.meta.lock().expect("session meta poisoned");
-            if meta.state != SessionState::PendingMonitor {
-                bail!("session is not waiting for a monitor");
+            if meta.state != SessionState::AwaitingBackgroundTask {
+                bail!("session is not waiting for its background task");
             }
-            meta.monitor_connected = true;
             meta.state = SessionState::Starting;
         }
         write_half
-            .write_all(b"[starting] monitor authenticated\n")
+            .write_all(b"[starting] background task attached\n")
             .await?;
         let mut events = session.events.subscribe();
         if let Err(error) = self.start_session(&request.session_id).await {
@@ -550,11 +534,11 @@ impl Manager {
         session.master.lock().expect("master poisoned").take();
         session.set_state(SessionState::Closed);
         session.event("[closed] session terminated");
-        runtime::remove_ticket(&self.instance_id, session_id);
+        runtime::remove_background_task_ticket(&self.instance_id, session_id);
         runtime::remove_control(&self.instance_id, session_id);
-        self.tickets
+        self.background_task_tickets
             .lock()
-            .expect("tickets poisoned")
+            .expect("background task tickets poisoned")
             .remove(session_id);
         self.control_tokens
             .lock()
@@ -596,13 +580,14 @@ impl Manager {
         let Ok(session) = self.get(session_id) else {
             return;
         };
-        if session.meta.lock().expect("meta poisoned").state == SessionState::PendingMonitor {
+        if session.meta.lock().expect("meta poisoned").state == SessionState::AwaitingBackgroundTask
+        {
             session.set_state(SessionState::Failed);
-            session.event("[failed] watch ticket expired");
-            runtime::remove_ticket(&self.instance_id, session_id);
-            self.tickets
+            session.event("[failed] background task ticket expired");
+            runtime::remove_background_task_ticket(&self.instance_id, session_id);
+            self.background_task_tickets
                 .lock()
-                .expect("tickets poisoned")
+                .expect("background task tickets poisoned")
                 .remove(session_id);
             self.control_tokens
                 .lock()
@@ -617,15 +602,15 @@ impl Manager {
             .write()
             .expect("sessions poisoned")
             .remove(session_id);
-        self.tickets
+        self.background_task_tickets
             .lock()
-            .expect("tickets poisoned")
+            .expect("background task tickets poisoned")
             .remove(session_id);
         self.control_tokens
             .lock()
             .expect("control tokens poisoned")
             .remove(session_id);
-        runtime::remove_ticket(&self.instance_id, session_id);
+        runtime::remove_background_task_ticket(&self.instance_id, session_id);
         runtime::remove_control(&self.instance_id, session_id);
     }
 
@@ -756,7 +741,8 @@ impl Drop for Manager {
 }
 
 #[derive(Debug, Deserialize)]
-struct WatchRequest {
+struct BackgroundTaskRequest {
+    action: String,
     instance_id: String,
     session_id: String,
     token: String,

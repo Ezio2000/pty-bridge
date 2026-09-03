@@ -13,7 +13,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Mcp,
-    Watch {
+    BackgroundTask {
         #[arg(long)]
         instance: String,
         #[arg(long)]
@@ -44,8 +44,8 @@ async fn main() -> Result<()> {
             let server = pty_bridge::mcp::PtyServer::new().await?;
             server.serve(stdio()).await?.waiting().await?;
         }
-        Command::Watch { instance, session } => {
-            pty_bridge::watcher::run(&instance, &session).await?
+        Command::BackgroundTask { instance, session } => {
+            pty_bridge::background_task::run(&instance, &session).await?
         }
         Command::Hook {
             command: HookCommand::Bind,

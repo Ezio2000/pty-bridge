@@ -22,6 +22,10 @@ const plugin = require(path.join(root, 'packages/plugin/package.json'));
 const manifest = require(path.join(root, 'packages/plugin/.claude-plugin/plugin.json'));
 if (manifest.version !== expectedVersion) throw new Error('Plugin manifest/npm version mismatch');
 if (!plugin.files.includes('native')) throw new Error('Plugin package must include bundled native binaries');
+if (!plugin.files.includes('skills')) throw new Error('Plugin package must include its PTY skill');
+if (!fs.existsSync(path.join(root, 'packages/plugin/skills/pty/SKILL.md'))) {
+  throw new Error('PTY workflow skill is missing');
+}
 for (const target of targets) {
   if (plugin.optionalDependencies[`@pty-bridge/${target}`] !== expectedVersion) {
     throw new Error(`Optional dependency version mismatch for ${target}`);

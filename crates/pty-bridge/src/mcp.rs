@@ -12,7 +12,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DEFAULT_COLS, DEFAULT_ROWS, DEFAULT_TICKET_TTL_SECONDS,
+    DEFAULT_BACKGROUND_TASK_TICKET_TTL_SECONDS, DEFAULT_COLS, DEFAULT_ROWS,
     manager::{Manager, SessionSnapshot, SessionState, StartSpec},
 };
 
@@ -41,21 +41,7 @@ pub struct StartRequest {
     pub env: HashMap<String, String>,
     pub rows: Option<u16>,
     pub cols: Option<u16>,
-    #[serde(default = "default_monitor")]
-    pub monitor: MonitorMode,
-    pub watch_ticket_ttl_seconds: Option<u64>,
-}
-
-#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum MonitorMode {
-    #[default]
-    Required,
-    Disabled,
-}
-
-fn default_monitor() -> MonitorMode {
-    MonitorMode::Required
+    pub background_task_ticket_ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -64,8 +50,8 @@ pub struct StartResponse {
     pub session_id: String,
     pub control_port: u16,
     pub state: SessionState,
-    pub watch_command: Option<String>,
-    pub next_action: Option<String>,
+    pub background_task_command: String,
+    pub next_action: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -140,7 +126,7 @@ pub struct ActionResponse {
 impl PtyServer {
     #[tool(
         name = "start",
-        description = "Prepare and start a real interactive PTY session. With monitor=required (default), the process remains pending until you immediately invoke the Claude Code Monitor tool with the returned watch_command. The command contains no secret; do not modify it."
+        description = "Prepare a real interactive PTY session. The process waits until you immediately run the returned background_task_command with the Bash tool using run_in_background=true. Use the command exactly as returned; it contains no secret."
     )]
     async fn start(
         &self,
@@ -150,10 +136,10 @@ impl PtyServer {
             return Err("program must not be empty".into());
         }
         let ttl = req
-            .watch_ticket_ttl_seconds
-            .unwrap_or(DEFAULT_TICKET_TTL_SECONDS);
+            .background_task_ticket_ttl_seconds
+            .unwrap_or(DEFAULT_BACKGROUND_TASK_TICKET_TTL_SECONDS);
         if !(30..=86_400).contains(&ttl) {
-            return Err("watch_ticket_ttl_seconds must be between 30 and 86400".into());
+            return Err("background_task_ticket_ttl_seconds must be between 30 and 86400".into());
         }
         let cwd = req
             .cwd
@@ -173,22 +159,17 @@ impl PtyServer {
             rows,
             cols,
         };
-        let required = matches!(req.monitor, MonitorMode::Required);
-        let (session_id, watch_command) = self
+        let (session_id, background_task_command) = self
             .manager
-            .create(spec, required, Duration::from_secs(ttl))
+            .create(spec, Duration::from_secs(ttl))
             .map_err(|e| e.to_string())?;
         Ok(Json(StartResponse {
             instance_id: self.manager.instance_id().to_string(),
             session_id,
             control_port: self.manager.port(),
-            state: if required {
-                SessionState::PendingMonitor
-            } else {
-                SessionState::Starting
-            },
-            next_action: required.then(|| "call_monitor".into()),
-            watch_command,
+            state: SessionState::AwaitingBackgroundTask,
+            next_action: "run_background_task".into(),
+            background_task_command,
         }))
     }
 
@@ -336,7 +317,7 @@ impl PtyServer {
 impl ServerHandler for PtyServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Use these tools for commands that need a real interactive terminal. After start returns next_action=call_monitor, immediately call the built-in Monitor tool using watch_command exactly as returned. Do not expose or search for watch tickets. Use read/write/resize/signal for subsequent interaction.",
+            "Use these tools for commands that need a real interactive terminal. After start returns next_action=run_background_task, immediately invoke Bash with background_task_command exactly as returned and run_in_background=true. Never run it in the foreground. The Background Task provides the live status display and owns the PTY lifetime. Use read/write/resize/signal for subsequent interaction.",
         ).with_server_info(
             Implementation::new("pty-bridge", env!("CARGO_PKG_VERSION"))
                 .with_title("PTY Bridge")

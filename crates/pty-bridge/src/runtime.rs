@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::APP_NAME;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Ticket {
+pub struct BackgroundTaskTicket {
     pub instance_id: String,
     pub session_id: String,
     pub port: u16,
@@ -70,13 +70,13 @@ pub fn instance_dir(instance_id: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-pub fn ticket_path(instance_id: &str, session_id: &str) -> Result<PathBuf> {
+pub fn background_task_ticket_path(instance_id: &str, session_id: &str) -> Result<PathBuf> {
     validate_id(session_id)?;
-    Ok(instance_dir(instance_id)?.join(format!("{session_id}.ticket")))
+    Ok(instance_dir(instance_id)?.join(format!("{session_id}.bgtask")))
 }
 
-pub fn write_ticket(ticket: &Ticket) -> Result<PathBuf> {
-    let path = ticket_path(&ticket.instance_id, &ticket.session_id)?;
+pub fn write_background_task_ticket(ticket: &BackgroundTaskTicket) -> Result<PathBuf> {
+    let path = background_task_ticket_path(&ticket.instance_id, &ticket.session_id)?;
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -84,26 +84,32 @@ pub fn write_ticket(ticket: &Ticket) -> Result<PathBuf> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut file = opts.open(&path).context("create private watch ticket")?;
+    let mut file = opts
+        .open(&path)
+        .context("create private background task ticket")?;
     serde_json::to_writer(&mut file, ticket)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
     Ok(path)
 }
 
-pub fn read_ticket(instance_id: &str, session_id: &str) -> Result<Ticket> {
-    let path = ticket_path(instance_id, session_id)?;
-    let data = fs::read(&path).context("read watch ticket")?;
-    let ticket: Ticket = serde_json::from_slice(&data).context("parse watch ticket")?;
+pub fn read_background_task_ticket(
+    instance_id: &str,
+    session_id: &str,
+) -> Result<BackgroundTaskTicket> {
+    let path = background_task_ticket_path(instance_id, session_id)?;
+    let data = fs::read(&path).context("read background task ticket")?;
+    let ticket: BackgroundTaskTicket =
+        serde_json::from_slice(&data).context("parse background task ticket")?;
     if ticket.expires_at_ms < now_ms() {
         let _ = fs::remove_file(&path);
-        bail!("watch ticket expired");
+        bail!("background task ticket expired");
     }
     Ok(ticket)
 }
 
-pub fn remove_ticket(instance_id: &str, session_id: &str) {
-    if let Ok(path) = ticket_path(instance_id, session_id) {
+pub fn remove_background_task_ticket(instance_id: &str, session_id: &str) {
+    if let Ok(path) = background_task_ticket_path(instance_id, session_id) {
         let _ = fs::remove_file(path);
     }
 }

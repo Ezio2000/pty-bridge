@@ -11,31 +11,31 @@ The repository keeps the host-specific project name at the boundary. Plugin, MCP
 ```text
 Host session
     |
-    |  mcp__pty__start(program, args, cwd, monitor=required)
+    |  mcp__pty__start(program, args, cwd)
     v
 MCP server (pty-bridge)
     |
-    +-- create PendingMonitor session
+    +-- create AwaitingBackgroundTask session
     +-- write private, one-use ticket (default TTL: 30 minutes)
-    +-- return session_id + watch_command (no secret)
+    +-- return session_id + background_task_command (no secret)
     |
-LLM immediately calls built-in Monitor(watch_command)
+LLM immediately calls Bash(background_task_command, run_in_background=true)
     |
     v
-watch process -- reads ticket out of band --> loopback authentication
-    |                                          |
-    |                                          +-- consume ticket
-    |                                          +-- spawn target in PTY
-    |                                          +-- stream throttled status/tail
+Background Task -- reads ticket out of band --> loopback authentication
+    |                                             |
+    |                                             +-- consume ticket
+    |                                             +-- spawn target in PTY
+    |                                             +-- stream throttled status/tail
     v
 LLM uses mcp__pty__read/write/resize/signal/status/close
 
 PostToolUse hook: bind host session -> PTY session ownership
 SessionEnd hook: authenticate over the private control channel -> close owned PTYs
-Monitor disconnect: close its PTY immediately
+Background Task disconnect: close its PTY immediately
 ```
 
-There is no tmux server, daemon, plugin skill, or model-visible credential. The Monitor is started by the LLM only after `start`; hooks are limited to ownership bookkeeping and guaranteed cleanup.
+There is no tmux server, daemon, or model-visible credential. The bundled skill tells the LLM to start the Background Task immediately after `start`; hooks are limited to ownership bookkeeping and guaranteed cleanup.
 
 ## Install
 
@@ -57,7 +57,7 @@ Then add this repository as a local plugin marketplace or point your development
 
 ## MCP tools
 
-- `start`: creates a session. The default `monitor=required` delays process launch until Monitor authentication. `watch_ticket_ttl_seconds` defaults to 1800 and accepts 30–86400.
+- `start`: creates a session and delays process launch until its Background Task attaches. `background_task_ticket_ttl_seconds` defaults to 1800 and accepts 30–86400.
 - `read`: reads retained output from a byte cursor without consuming it globally.
 - `write`: sends text/control characters and returns promptly available output.
 - `resize`: changes terminal rows and columns.
@@ -69,15 +69,13 @@ Output is retained in a bounded 1 MiB per-session ring. A stale cursor reports t
 
 ## Security and lifecycle
 
-- Watch and cleanup listeners bind only to a random `127.0.0.1` port.
-- Watch credentials are 256-bit random values stored in private runtime files, consumed once, and never returned through MCP or placed on the command line.
-- Control credentials are separate from watch credentials.
+- Background Task and cleanup listeners bind only to a random `127.0.0.1` port.
+- Background Task credentials are 256-bit random values stored in private runtime files, consumed once, and never returned through MCP or placed on the command line.
+- Control credentials are separate from Background Task credentials.
 - Runtime directories are mode `0700` and files `0600` on Unix. Windows uses the current user's LocalAppData directory and its inherited user ACL.
-- A required-monitor process cannot start before the watcher proves possession of its ticket.
-- Monitor disconnect, explicit close, host `SessionEnd`, and MCP server shutdown all terminate associated sessions.
+- A PTY process cannot start before its Background Task proves possession of the ticket.
+- Background Task disconnect, explicit close, host `SessionEnd`, and MCP server shutdown all terminate associated sessions.
 - Windows sessions are assigned to a Job Object with `KILL_ON_JOB_CLOSE`; Unix termination targets the PTY process group, so descendant processes are cleaned up on both families.
-
-`monitor=disabled` is available for automation and tests. It intentionally removes the Monitor-disconnect guarantee; the SessionEnd hook and server shutdown still clean up the process.
 
 ## Development
 

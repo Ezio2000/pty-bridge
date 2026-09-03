@@ -1,1 +1,1 @@
-{"name":"@pty-bridge/darwin-x64","version":"0.1.1","license":"Apache-2.0","repository":{"type":"git","url":"git+https://github.com/Ezio2000/pty-bridge.git"},"os":["darwin"],"cpu":["x64"],"files":["bin","README.md","LICENSE"],"publishConfig":{"access":"public","provenance":true}}
+{"name":"@pty-bridge/darwin-x64","version":"0.2.0","license":"Apache-2.0","repository":{"type":"git","url":"git+https://github.com/Ezio2000/pty-bridge.git"},"os":["darwin"],"cpu":["x64"],"files":["bin","README.md","LICENSE"],"publishConfig":{"access":"public","provenance":true}}

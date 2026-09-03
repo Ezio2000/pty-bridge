@@ -38,7 +38,7 @@ pub async fn cleanup_from_stdin() -> Result<()> {
         {
             errors.push(format!("{}: {error}", record.session_id));
         }
-        runtime::remove_ticket(&record.instance_id, &record.session_id);
+        runtime::remove_background_task_ticket(&record.instance_id, &record.session_id);
     }
     if errors.is_empty() {
         runtime::remove_ownership(&input.session_id);
