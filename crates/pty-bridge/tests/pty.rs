@@ -136,13 +136,11 @@ async fn session_end_hook_closes_owned_session() {
         "bind",
         serde_json::json!({
             "session_id": host_session,
-            "tool_response": {
-                "structuredContent": {
-                    "instance_id": manager.instance_id(),
-                    "session_id": session_id,
-                    "control_port": manager.port()
-                }
-            }
+            "tool_response": serde_json::json!({
+                "instance_id": manager.instance_id(),
+                "session_id": session_id,
+                "control_port": manager.port()
+            }).to_string()
         }),
     );
     run_hook("cleanup", serde_json::json!({ "session_id": host_session }));

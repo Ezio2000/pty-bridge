@@ -19,12 +19,12 @@ struct HookInput {
 
 pub async fn bind_from_stdin() -> Result<()> {
     let input = read_hook_input()?;
-    let response = unwrap_response(&input.tool_response);
+    let response = parse_response(input.tool_response)?;
     let record = Ownership {
         host_session_id: input.session_id,
-        instance_id: string_field(response, "instance_id")?,
-        session_id: string_field(response, "session_id")?,
-        port: number_field(response, "control_port")? as u16,
+        instance_id: string_field(&response, "instance_id")?,
+        session_id: string_field(&response, "session_id")?,
+        port: number_field(&response, "control_port")? as u16,
     };
     runtime::write_ownership(&record)
 }
@@ -80,8 +80,22 @@ fn read_hook_input() -> Result<HookInput> {
     serde_json::from_str(&data).context("parse hook input")
 }
 
-fn unwrap_response(value: &Value) -> &Value {
-    value.get("structuredContent").unwrap_or(value)
+fn parse_response(mut value: Value) -> Result<Value> {
+    for _ in 0..3 {
+        if let Some(structured) = value.get("structuredContent") {
+            value = structured.clone();
+            continue;
+        }
+        if let Some(encoded) = value.as_str() {
+            value = serde_json::from_str(encoded).context("parse MCP tool response JSON")?;
+            continue;
+        }
+        if value.is_object() {
+            return Ok(value);
+        }
+        bail!("unsupported MCP tool response shape");
+    }
+    bail!("MCP tool response is nested too deeply")
 }
 
 fn string_field(value: &Value, name: &str) -> Result<String> {
@@ -97,4 +111,29 @@ fn number_field(value: &Value, name: &str) -> Result<u64> {
         .get(name)
         .and_then(Value::as_u64)
         .ok_or_else(|| anyhow!("missing {name} in tool response"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_response;
+
+    #[test]
+    fn parses_direct_mcp_response() {
+        let value = serde_json::json!({"session_id": "pty_1"});
+        assert_eq!(parse_response(value).unwrap()["session_id"], "pty_1");
+    }
+
+    #[test]
+    fn parses_structured_mcp_response() {
+        let value = serde_json::json!({
+            "structuredContent": {"session_id": "pty_2"}
+        });
+        assert_eq!(parse_response(value).unwrap()["session_id"], "pty_2");
+    }
+
+    #[test]
+    fn parses_json_string_used_by_host_hooks() {
+        let value = serde_json::json!(r#"{"session_id":"pty_3"}"#);
+        assert_eq!(parse_response(value).unwrap()["session_id"], "pty_3");
+    }
 }
