@@ -60,7 +60,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --workspace --release --locked --target ${{ matrix.target }}
       - run: node scripts/stage-native.cjs ${{ matrix.package }} ${{ matrix.binary }}
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: native-${{ matrix.package }}
           path: packages/${{ matrix.package }}/bin/*
@@ -104,8 +104,21 @@ jobs:
           done
       - name: Publish native packages
         run: |
+          version=$(node -p "require('./packages/plugin/package.json').version")
           for target in darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-arm64 win32-x64; do
-            npm publish "./packages/$target" --access public
+            package="@pty-bridge/$target"
+            if npm view "$package@$version" version >/dev/null 2>&1; then
+              echo "$package@$version is already published; skipping"
+            else
+              npm publish "./packages/$target" --access public
+            fi
           done
       - name: Publish plugin
-        run: npm publish ./packages/plugin --access public
+        run: |
+          package=$(node -p "require('./packages/plugin/package.json').name")
+          version=$(node -p "require('./packages/plugin/package.json').version")
+          if npm view "$package@$version" version >/dev/null 2>&1; then
+            echo "$package@$version is already published; skipping"
+          else
+            npm publish ./packages/plugin --access public
+          fi
