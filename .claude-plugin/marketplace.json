@@ -8,13 +8,17 @@
   "plugins": [
     {
       "name": "pty-bridge",
-      "description": "Cross-platform interactive PTY sessions with a live Background Task",
+      "description": "Interactive PTY writer/reader with native completion tasks and a persistent silence monitor",
       "source": {
         "source": "npm",
         "package": "@pty-bridge/plugin"
       },
       "category": "development",
-      "tags": ["pty", "terminal", "mcp"]
+      "tags": [
+        "pty",
+        "terminal",
+        "mcp"
+      ]
     }
   ]
 }

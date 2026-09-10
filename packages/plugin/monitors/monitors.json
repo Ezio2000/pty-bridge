@@ -1,0 +1,8 @@
+[
+  {
+    "name": "pty-silence",
+    "command": "node \"${CLAUDE_PLUGIN_ROOT}/launcher/launch.cjs\" monitor",
+    "description": "Report suspected PTY silence; terminal output is read on demand",
+    "when": "always"
+  }
+]

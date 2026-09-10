@@ -1,6 +1,6 @@
 {
   "name": "@pty-bridge/plugin",
-  "version": "1.0.1",
+  "version": "2.0.0",
   "description": "Cross-platform interactive PTY plugin",
   "license": "Apache-2.0",
   "repository": {
@@ -14,6 +14,7 @@
     ".claude-plugin",
     ".mcp.json",
     "hooks",
+    "monitors",
     "launcher",
     "native",
     "README.md",

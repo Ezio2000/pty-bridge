@@ -22,10 +22,20 @@ if (fs.readFileSync(path.join(pluginDir, 'LICENSE'), 'utf8') !== fs.readFileSync
   throw new Error('Plugin license must match the repository license');
 }
 
-const expectedMatcher = 'mcp__plugin_pty-bridge_pty__start';
-if (hooks.hooks.PostToolUse?.[0]?.matcher !== expectedMatcher) {
-  throw new Error('PostToolUse hook must match the plugin-qualified start tool');
+if (hooks.hooks.PreToolUse?.[0]?.matcher !== 'mcp__plugin_pty-bridge_pty__start') {
+  throw new Error('PreToolUse must inject the owner into the plugin-qualified start tool');
 }
+if (hooks.hooks.PostToolUse?.[0]?.matcher !== 'mcp__plugin_pty-bridge_pty__read') {
+  throw new Error('PostToolUse must confirm the plugin-qualified read result');
+}
+const monitors = require(path.join(pluginDir, 'monitors', 'monitors.json'));
+if (!plugin.files.includes('monitors') || monitors.length !== 1 || monitors[0].when !== 'always') {
+  throw new Error('The package must ship one persistent native plugin monitor');
+}
+if (!monitors[0].command.includes('launch.cjs') || !monitors[0].command.endsWith(' monitor')) {
+  throw new Error('Monitor must run the native monitor command through the launcher');
+}
+if (!cargo.includes('"crates/pty-core"')) throw new Error('The workspace must include the independent core');
 if (hooks.hooks.SessionEnd?.[0]?.hooks?.[0]?.timeout !== 1) {
   throw new Error('SessionEnd hook must stay inside the host shutdown budget');
 }

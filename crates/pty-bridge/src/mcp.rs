@@ -1,6 +1,5 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
-
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use crate::manager::Manager;
+use pty_core::StartSpec;
 use rmcp::{
     ServerHandler,
     handler::server::{
@@ -11,23 +10,29 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
-use crate::{
-    DEFAULT_BACKGROUND_TASK_TICKET_TTL_SECONDS, DEFAULT_COLS, DEFAULT_ROWS,
-    manager::{
-        BackgroundTaskLaunch, Manager, SessionSnapshot, SessionState, StartSpec, Termination,
-    },
-};
-
-const DEFAULT_WRITE_READY_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_INPUT_BYTES: usize = 64 * 1024;
+/// MCP requires an object at the root of every output schema.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ToolResponse {
+    #[serde(flatten)]
+    fields: serde_json::Map<String, Value>,
+}
+fn response(value: Value) -> Json<ToolResponse> {
+    Json(ToolResponse {
+        fields: value
+            .as_object()
+            .expect("tool responses are objects")
+            .clone(),
+    })
+}
 
 #[derive(Clone)]
 pub struct PtyServer {
-    manager: Arc<Manager>,
+    pub manager: Arc<Manager>,
     tool_router: ToolRouter<Self>,
 }
-
 impl PtyServer {
     pub async fn new() -> anyhow::Result<Self> {
         Ok(Self {
@@ -37,15 +42,8 @@ impl PtyServer {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum NextAction {
-    RunBackgroundTask,
-    Interact,
-    None,
-}
-
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StartRequest {
     pub program: String,
     #[serde(default)]
@@ -55,20 +53,11 @@ pub struct StartRequest {
     pub env: HashMap<String, String>,
     pub rows: Option<u16>,
     pub cols: Option<u16>,
-    pub background_task_ticket_ttl_seconds: Option<u64>,
+    /// Injected by the plugin hook from the current Claude session; do not invent a value.
+    pub host_session_id: Option<String>,
 }
-
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct StartResponse {
-    pub instance_id: String,
-    pub session_id: String,
-    pub control_port: u16,
-    pub state: SessionState,
-    pub background_task: BackgroundTaskLaunch,
-    pub next_action: NextAction,
-}
-
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReadRequest {
     pub session_id: String,
     #[serde(default)]
@@ -76,45 +65,25 @@ pub struct ReadRequest {
     pub max_output_bytes: Option<usize>,
     pub yield_time_ms: Option<u64>,
 }
-
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct OutputData {
-    pub text: String,
-    pub base64: String,
-    pub text_lossy: bool,
-}
-
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct OutputResponse {
-    pub session_id: String,
-    pub output: OutputData,
-    pub next_cursor: u64,
-    pub dropped_bytes: u64,
-    pub state: SessionState,
-    pub termination: Option<Termination>,
-    pub next_action: NextAction,
-}
-
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WriteRequest {
     pub session_id: String,
     pub text: String,
-    pub yield_time_ms: Option<u64>,
 }
-
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ResizeRequest {
     pub session_id: String,
     pub rows: u16,
     pub cols: u16,
 }
-
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SignalRequest {
     pub session_id: String,
     pub signal: Signal,
 }
-
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Signal {
@@ -122,275 +91,276 @@ pub enum Signal {
     Terminate,
     Kill,
 }
-
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StatusRequest {
     pub session_id: Option<String>,
 }
-
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct StatusResponse {
-    pub sessions: Vec<SessionSnapshot>,
-}
-
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CloseRequest {
     pub session_id: String,
-}
-
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct ActionResponse {
-    pub session_id: String,
-    pub state: SessionState,
-    pub termination: Option<Termination>,
-    pub next_action: NextAction,
 }
 
 #[tool_router]
 impl PtyServer {
     #[tool(
         name = "start",
-        description = "Create a real interactive PTY. Immediately run background_task.command with background_task.tool and run_in_background=true exactly as returned. The target process cannot start before that Background Task attaches; the returned command contains no secret."
+        description = "Start a real PTY and child immediately, after the session's plugin monitor is ready. Success confirms process creation, not command completion or application readiness. Immediately run background_task.command using background_task.tool with run_in_background=true to register completion/failure notifications. If that call fails or is denied, close the PTY."
     )]
     async fn start(
         &self,
         Parameters(req): Parameters<StartRequest>,
-    ) -> Result<Json<StartResponse>, String> {
-        if std::env::var_os("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS")
-            .is_some_and(|value| value != "0")
-        {
-            return Err(
-                "Background Tasks are disabled; PTY Bridge cannot establish lifecycle ownership"
-                    .into(),
-            );
+    ) -> Result<Json<ToolResponse>, String> {
+        if std::env::var_os("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS").is_some_and(|v| v != "0") {
+            return Err("Background Tasks are disabled; PTY Bridge requires the native monitor and a bgshell per PTY".into());
         }
-        if req.program.is_empty() {
-            return Err("program must not be empty".into());
-        }
-        let ttl = req
-            .background_task_ticket_ttl_seconds
-            .unwrap_or(DEFAULT_BACKGROUND_TASK_TICKET_TTL_SECONDS);
-        if !(30..=86_400).contains(&ttl) {
-            return Err("background_task_ticket_ttl_seconds must be between 30 and 86400".into());
-        }
-        let cwd = req
-            .cwd
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("PTY_BRIDGE_PROJECT_DIR").map(PathBuf::from))
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let rows = req.rows.unwrap_or(DEFAULT_ROWS);
-        let cols = req.cols.unwrap_or(DEFAULT_COLS);
-        if rows == 0 || cols == 0 {
-            return Err("rows and cols must be greater than zero".into());
-        }
+        let host = req
+            .host_session_id
+            .ok_or("missing host_session_id; the PTY Bridge PreToolUse hook must be enabled")?;
         let spec = StartSpec {
             program: req.program,
             args: req.args,
-            cwd,
+            cwd: req
+                .cwd
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("PTY_BRIDGE_PROJECT_DIR").map(PathBuf::from))
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
             env: req.env,
-            rows,
-            cols,
+            rows: req.rows.unwrap_or(24),
+            cols: req.cols.unwrap_or(80),
         };
-        let (session_id, background_task) = self
+        let entry = self
             .manager
-            .create(spec, Duration::from_secs(ttl))
-            .map_err(|error| error.to_string())?;
-        Ok(Json(StartResponse {
-            instance_id: self.manager.instance_id().to_string(),
-            session_id,
-            control_port: self.manager.port(),
-            state: SessionState::AwaitingBackgroundTask,
-            background_task,
-            next_action: NextAction::RunBackgroundTask,
-        }))
+            .start(&host, spec)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        let launch = match wait_launch(self.manager.instance_id(), &entry.id, self.manager.port()) {
+            Ok(launch) => launch,
+            Err(error) => {
+                let _ = self.manager.close(&entry.id);
+                return Err(error.to_string());
+            }
+        };
+        Ok(response(
+            json!({"instance_id":self.manager.instance_id(),"control_port":self.manager.port(),"session_id":entry.id,
+            "state":entry.session.snapshot().state,"termination":entry.snapshot()["termination"],
+            "background_task":launch,"next_action":"run_background_task"}),
+        ))
     }
 
     #[tool(
         name = "read",
-        description = "Read retained PTY bytes from an independent cursor. output.text is convenient text; output.base64 is the lossless source when text_lossy=true. The call waits for new output up to yield_time_ms without polling."
+        description = "Read retained terminal bytes by independent cursor; this is the only tool returning terminal output. start_cursor..next_cursor is the actual returned range; dropped_bytes were lost, not read. base64 preserves all returned bytes. Wait up to yield_time_ms (maximum 30000) without polling. An empty read does not reset silence detection."
     )]
     async fn read(
         &self,
         Parameters(req): Parameters<ReadRequest>,
-    ) -> Result<Json<OutputResponse>, String> {
-        let wait = Duration::from_millis(req.yield_time_ms.unwrap_or(0).min(30_000));
+    ) -> Result<Json<ToolResponse>, String> {
+        let max = req.max_output_bytes.unwrap_or(64 * 1024).min(1024 * 1024);
+        if max == 0 {
+            return Err("max_output_bytes must be greater than zero".into());
+        }
         self.manager
-            .wait_for_output(&req.session_id, req.cursor, wait)
+            .read(
+                &req.session_id,
+                req.cursor,
+                max,
+                Duration::from_millis(req.yield_time_ms.unwrap_or(0).min(30000)),
+            )
             .await
-            .map_err(|error| error.to_string())?;
-        self.output_response(
-            &req.session_id,
-            req.cursor,
-            req.max_output_bytes.unwrap_or(64 * 1024).min(1024 * 1024),
-        )
+            .map(response)
+            .map_err(|e| e.to_string())
     }
-
     #[tool(
         name = "write",
-        description = "Write UTF-8 text or control characters to a PTY. If attachment is still starting, this waits briefly until the PTY is writable, then waits for prompt output without polling."
+        description = "Write UTF-8 input/control bytes through the single writer. Returns confirmed bytes_written and interaction_id, with no terminal output. Success does not prove the input was interpreted as a command. Use read to inspect the result. On partial/uncertain failure do not retry automatically."
     )]
     async fn write(
         &self,
         Parameters(req): Parameters<WriteRequest>,
-    ) -> Result<Json<OutputResponse>, String> {
-        if req.text.len() > MAX_INPUT_BYTES {
-            return Err(format!("text exceeds {MAX_INPUT_BYTES} UTF-8 bytes"));
+    ) -> Result<Json<ToolResponse>, String> {
+        if req.text.len() > 64 * 1024 {
+            return Err("text exceeds 65536 UTF-8 bytes".into());
         }
-        self.manager
-            .wait_until_running(&req.session_id, DEFAULT_WRITE_READY_TIMEOUT)
-            .await
-            .map_err(|error| error.to_string())?;
-        let cursor = self
+        let entry = self
             .manager
-            .snapshots(Some(&req.session_id))
-            .map_err(|error| error.to_string())?[0]
-            .retained_end;
-        let manager = Arc::clone(&self.manager);
-        let write_session_id = req.session_id.clone();
-        let text = req.text;
-        tokio::task::spawn_blocking(move || manager.write(&write_session_id, &text))
+            .get(&req.session_id)
+            .map_err(|e| e.to_string())?;
+        let receipt = entry
+            .session
+            .writer()
+            .write(req.text.as_bytes())
             .await
-            .map_err(|error| error.to_string())?
-            .map_err(|error| error.to_string())?;
-        self.manager
-            .wait_for_output(
-                &req.session_id,
-                cursor,
-                Duration::from_millis(req.yield_time_ms.unwrap_or(250).min(30_000)),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        self.output_response(&req.session_id, cursor, 64 * 1024)
+            .map_err(|e| serde_json::to_string(&e).unwrap())?;
+        Ok(response(
+            json!({"session_id":req.session_id,"bytes_written":receipt.bytes_written,"interaction_id":receipt.interaction_id,
+            "state":entry.session.snapshot().state,"termination":entry.snapshot()["termination"]}),
+        ))
     }
-
-    #[tool(name = "resize", description = "Resize a running PTY terminal.")]
+    #[tool(
+        name = "resize",
+        description = "Resize the running terminal. Resizing does not restart the input interaction or silence timer."
+    )]
     fn resize(
         &self,
         Parameters(req): Parameters<ResizeRequest>,
-    ) -> Result<Json<ActionResponse>, String> {
-        self.manager
-            .resize(&req.session_id, req.rows, req.cols)
-            .map_err(|error| error.to_string())?;
-        self.action_response(&req.session_id)
+    ) -> Result<Json<ToolResponse>, String> {
+        let entry = self
+            .manager
+            .get(&req.session_id)
+            .map_err(|e| e.to_string())?;
+        entry
+            .session
+            .resize(req.rows, req.cols)
+            .map_err(|e| e.to_string())?;
+        Ok(response(entry.snapshot()))
     }
-
     #[tool(
         name = "signal",
-        description = "Send interrupt, terminate, or kill semantics to a running PTY process tree."
+        description = "Interrupt sends Ctrl-C through the writer. Terminate/kill signal the process tree independently of a blocked writer."
     )]
-    fn signal(
+    async fn signal(
         &self,
         Parameters(req): Parameters<SignalRequest>,
-    ) -> Result<Json<ActionResponse>, String> {
+    ) -> Result<Json<ToolResponse>, String> {
         match req.signal {
-            Signal::Interrupt => self.manager.interrupt(&req.session_id),
-            Signal::Terminate => self.manager.terminate(&req.session_id, false),
-            Signal::Kill => self.manager.terminate(&req.session_id, true),
+            Signal::Interrupt => {
+                let entry = self
+                    .manager
+                    .get(&req.session_id)
+                    .map_err(|e| e.to_string())?;
+                entry
+                    .session
+                    .writer()
+                    .write(b"\x03")
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            Signal::Terminate => self
+                .manager
+                .signal(&req.session_id, false)
+                .map_err(|e| e.to_string())?,
+            Signal::Kill => self
+                .manager
+                .signal(&req.session_id, true)
+                .map_err(|e| e.to_string())?,
         }
-        .map_err(|error| error.to_string())?;
-        self.action_response(&req.session_id)
+        Ok(response(
+            self.manager
+                .get(&req.session_id)
+                .map_err(|e| e.to_string())?
+                .snapshot(),
+        ))
     }
-
     #[tool(
         name = "status",
-        description = "Inspect PTY lifecycle, explicit termination reason, terminal dimensions, retained byte range, and recent output."
+        description = "Inspect session lifecycle, termination, dimensions, activity times and retained byte range. Contains no terminal text and does not acknowledge output as read."
     )]
     fn status(
         &self,
         Parameters(req): Parameters<StatusRequest>,
-    ) -> Result<Json<StatusResponse>, String> {
-        Ok(Json(StatusResponse {
-            sessions: self
-                .manager
-                .snapshots(req.session_id.as_deref())
-                .map_err(|error| error.to_string())?,
-        }))
+    ) -> Result<Json<ToolResponse>, String> {
+        Ok(response(
+            json!({"sessions":self.manager.snapshots(req.session_id.as_deref()).map_err(|e|e.to_string())?}),
+        ))
     }
-
     #[tool(
         name = "close",
-        description = "Finish and force-stop a session only when abandoning a target that is still waiting, starting, or running. Finished sessions are already finalized automatically, so do not close them."
+        description = "Abandon and force-stop a PTY. Idempotent; finished output remains readable without requiring close."
     )]
     fn close(
         &self,
         Parameters(req): Parameters<CloseRequest>,
-    ) -> Result<Json<ActionResponse>, String> {
+    ) -> Result<Json<ToolResponse>, String> {
         self.manager
             .close(&req.session_id)
-            .map_err(|error| error.to_string())?;
-        self.action_response(&req.session_id)
+            .map_err(|e| e.to_string())?;
+        Ok(response(
+            self.manager
+                .get(&req.session_id)
+                .map_err(|e| e.to_string())?
+                .snapshot(),
+        ))
     }
 }
 
-impl PtyServer {
-    fn output_response(
-        &self,
-        session_id: &str,
-        cursor: u64,
-        max_bytes: usize,
-    ) -> Result<Json<OutputResponse>, String> {
-        let data = self
-            .manager
-            .read(session_id, cursor, max_bytes)
-            .map_err(|error| error.to_string())?;
-        let snapshot = self
-            .manager
-            .snapshots(Some(session_id))
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .next()
-            .ok_or_else(|| "session disappeared".to_string())?;
-        Ok(Json(OutputResponse {
-            session_id: session_id.to_string(),
-            output: OutputData {
-                text: String::from_utf8_lossy(&data.bytes).into_owned(),
-                base64: BASE64.encode(&data.bytes),
-                text_lossy: std::str::from_utf8(&data.bytes).is_err(),
-            },
-            next_cursor: data.next_cursor,
-            dropped_bytes: data.dropped_bytes,
-            state: snapshot.state,
-            termination: snapshot.termination,
-            next_action: next_action(snapshot.state),
-        }))
+pub fn wait_launch(instance: &str, session: &str, port: u16) -> anyhow::Result<Value> {
+    let exe = std::env::current_exe()?.to_string_lossy().into_owned();
+    #[cfg(not(windows))]
+    {
+        Ok(
+            json!({"tool":"Bash","command":format!("{} wait --instance {} --session {} --port {port}",shell_quote(&exe),shell_quote(instance),shell_quote(session)),"run_in_background":true}),
+        )
     }
-
-    fn action_response(&self, session_id: &str) -> Result<Json<ActionResponse>, String> {
-        let snapshot = self
-            .manager
-            .snapshots(Some(session_id))
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .next()
-            .ok_or_else(|| "session disappeared".to_string())?;
-        Ok(Json(ActionResponse {
-            session_id: session_id.to_string(),
-            state: snapshot.state,
-            termination: snapshot.termination,
-            next_action: next_action(snapshot.state),
-        }))
+    #[cfg(windows)]
+    {
+        Ok(
+            json!({"tool":"PowerShell","command":format!("& {} wait --instance {} --session {} --port {port}; exit $LASTEXITCODE",shell_quote(&exe),shell_quote(instance),shell_quote(session)),"run_in_background":true}),
+        )
     }
 }
-
-fn next_action(state: SessionState) -> NextAction {
-    match state {
-        SessionState::AwaitingBackgroundTask => NextAction::RunBackgroundTask,
-        SessionState::Starting | SessionState::Running => NextAction::Interact,
-        SessionState::Finished => NextAction::None,
-    }
+#[cfg(not(windows))]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+#[cfg(windows)]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
-#[tool_handler(router = self.tool_router)]
+#[tool_handler(router=self.tool_router)]
 impl ServerHandler for PtyServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(
-                "Use PTY Bridge for commands that require a real terminal, including interactive prompts, REPLs, debuggers, installers, and TUIs. Call start, then immediately invoke background_task.tool with background_task.command exactly as returned and run_in_background=true; never run that command in the foreground or modify it. Wait only for the host to confirm the Background Task started, then use read/write/resize/signal. Follow next_action on every response. state=finished is fully finalized: output remains readable, credentials are removed, and close is neither required nor appropriate. Call close only to abandon a session that is still waiting, starting, or running. No Skill invocation is required.",
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+            "Use PTY Bridge for real interactive terminals. The plugin monitor must be continuously online. start actually creates the target, then returns an exact bgshell wait command: run background_task.tool with background_task.command and run_in_background=true immediately, including for a target that already finished. This wait command does not start the target. If registering the background task fails or is denied, call close. write only confirms bytes written; read is the only source of terminal output. Do not assume a write executed a command or made an application ready. A monitor notice means only suspected silence; call read and decide what to do. Finished sessions retain bounded output and need no close. Never retry partial or uncertain writes automatically. No Skill invocation is required.")
+            .with_server_info(Implementation::new("pty-bridge",env!("CARGO_PKG_VERSION")).with_title("PTY Bridge"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn every_mcp_schema_has_an_object_root() {
+        let tools = PtyServer::tool_router().list_all();
+        assert_eq!(tools.len(), 7);
+        for tool in tools {
+            assert_eq!(
+                tool.input_schema.get("type"),
+                Some(&json!("object")),
+                "{} input",
+                tool.name
+            );
+            assert_eq!(
+                tool.output_schema.unwrap().get("type"),
+                Some(&json!("object")),
+                "{} output",
+                tool.name
+            );
+        }
+    }
+    #[test]
+    fn removed_input_fields_are_rejected() {
+        assert!(
+            serde_json::from_value::<WriteRequest>(
+                json!({"session_id":"pty_x","text":"x","yield_time_ms":2})
             )
-            .with_server_info(
-                Implementation::new("pty-bridge", env!("CARGO_PKG_VERSION"))
-                    .with_title("PTY Bridge")
-                    .with_description("Cross-platform interactive terminal sessions"),
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<StartRequest>(
+                json!({"program":"sh","background_task_ticket_ttl_seconds":30})
             )
+            .is_err()
+        );
+    }
+    #[test]
+    fn wait_command_quotes_paths_and_has_no_start_phase() {
+        let launch = wait_launch("inst_x", "pty_x", 123).unwrap();
+        let command = launch["command"].as_str().unwrap();
+        assert!(command.contains(" wait "));
+        assert!(command.contains("--port 123"));
+        assert!(shell_quote("a'b c").starts_with('\''));
     }
 }

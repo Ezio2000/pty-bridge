@@ -1,14 +1,35 @@
 {
-  "description": "Bind PTY ownership and finish active sessions when the host session ends",
+  "description": "Associate starts with the Claude session, confirm returned read ranges, and clean up process trees",
   "hooks": {
-    "PostToolUse": [
+    "PreToolUse": [
       {
         "matcher": "mcp__plugin_pty-bridge_pty__start",
         "hooks": [
           {
             "type": "command",
             "command": "node",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/launcher/launch.cjs", "hook", "bind"],
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/launcher/launch.cjs",
+              "hook",
+              "prepare"
+            ],
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__plugin_pty-bridge_pty__read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/launcher/launch.cjs",
+              "hook",
+              "observe"
+            ],
             "timeout": 2
           }
         ]
@@ -20,7 +41,11 @@
           {
             "type": "command",
             "command": "node",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/launcher/launch.cjs", "hook", "cleanup"],
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/launcher/launch.cjs",
+              "hook",
+              "cleanup"
+            ],
             "timeout": 1
           }
         ]

@@ -1,399 +1,353 @@
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use pty_bridge::protocol::{receive, send};
+use pty_bridge::{manager::Manager, runtime, wait};
+use pty_core::{SessionState, StartSpec};
+use serde_json::{Value, json};
 use std::{
     io::Write,
     process::{Command, Stdio},
     sync::Arc,
     time::Duration,
 };
+use tokio::{io::BufReader, net::TcpStream};
 
-#[cfg(unix)]
-use pty_bridge::runtime::{BackgroundTaskTicket, ControlRecord, Ownership, ProcessLocator};
-use pty_bridge::{
-    MAX_SESSIONS, background_task,
-    manager::{FinishReason, Manager, SessionState, StartSpec, default_spec},
-    runtime,
-};
-
-fn marker_spec(marker: &str) -> StartSpec {
-    #[cfg(unix)]
-    return default_spec(
-        "/bin/sh".into(),
-        vec!["-c".into(), format!("printf {marker}")],
-        std::env::current_dir().unwrap(),
-    );
-    #[cfg(windows)]
-    return default_spec(
-        "cmd.exe".into(),
-        vec!["/C".into(), format!("echo {marker}")],
-        std::env::current_dir().unwrap(),
-    );
+struct Monitor {
+    host: String,
+    child: std::process::Child,
 }
-
-fn long_running_spec() -> StartSpec {
-    #[cfg(unix)]
-    return default_spec(
-        "/bin/sh".into(),
-        vec!["-c".into(), "printf READY; sleep 30".into()],
-        std::env::current_dir().unwrap(),
-    );
-    #[cfg(windows)]
-    return default_spec(
-        "cmd.exe".into(),
-        vec!["/C".into(), "echo READY & ping -n 30 127.0.0.1 >NUL".into()],
-        std::env::current_dir().unwrap(),
-    );
-}
-
-async fn wait_for_output(manager: &Manager, session_id: &str, needle: &str) -> String {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-    loop {
-        let output = manager.read(session_id, 0, 1024 * 1024).unwrap();
-        let text = String::from_utf8_lossy(&output.bytes).into_owned();
-        if text.contains(needle) {
-            return text;
+impl Monitor {
+    async fn start() -> Self {
+        let host = format!("host_{}", uuid::Uuid::new_v4().simple());
+        let child = Command::new(env!("CARGO_BIN_EXE_pty-bridge"))
+            .args(["monitor", "--host-session-id", &host])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let monitor = Self { host, child };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while runtime::read_monitor(&monitor.host).is_err() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(tokio::time::Instant::now() < deadline, "output: {text:?}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        monitor
+    }
+    fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
-
-async fn wait_for_state(manager: &Manager, session_id: &str, state: SessionState) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-    while manager.state(session_id).unwrap() != state {
-        assert!(tokio::time::Instant::now() < deadline);
-        tokio::time::sleep(Duration::from_millis(20)).await;
+impl Drop for Monitor {
+    fn drop(&mut self) {
+        self.kill();
+        let _ = std::fs::remove_file(runtime::monitor_path(&self.host).unwrap());
     }
 }
-
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn interactive_session_is_a_real_tty() {
-    let manager = Manager::new().await.unwrap();
-    let spec = default_spec("/bin/sh".into(), vec![], std::env::current_dir().unwrap());
-    let (session_id, _) = manager.create(spec, Duration::from_secs(30)).unwrap();
-
-    let instance_id = manager.instance_id().to_string();
-    let attached_id = session_id.clone();
-    let background =
-        tokio::spawn(async move { background_task::run(&instance_id, &attached_id).await });
-
-    wait_for_state(&manager, &session_id, SessionState::Running).await;
-    manager
-        .write(
-            &session_id,
-            "test -t 0 && test -t 1 && test -t 2 && echo PTY_OK\n",
+fn command(script: &str) -> StartSpec {
+    #[cfg(unix)]
+    {
+        StartSpec::new(
+            "/bin/sh",
+            vec!["-c".into(), script.into()],
+            std::env::current_dir().unwrap(),
         )
-        .unwrap();
-    let output = wait_for_output(&manager, &session_id, "PTY_OK").await;
-    assert!(output.contains("PTY_OK"));
-    manager.close(&session_id).unwrap();
-    background.await.unwrap().unwrap();
-    let snapshot = manager.snapshots(Some(&session_id)).unwrap().remove(0);
-    assert_eq!(snapshot.state, SessionState::Finished);
-    assert_eq!(
-        snapshot.termination.unwrap().reason,
-        FinishReason::ExplicitClose
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn natural_exit_is_fully_finalized() {
-    let manager = Manager::new().await.unwrap();
-    let (session_id, launch) = manager
-        .create(marker_spec("NATURAL_EXIT_OK"), Duration::from_secs(30))
-        .unwrap();
-    assert!(launch.command.contains("background-task"));
-    assert_eq!(
-        manager.state(&session_id).unwrap(),
-        SessionState::AwaitingBackgroundTask
-    );
-    let instance_id = manager.instance_id().to_string();
-    let host_session = format!("host_{}", uuid::Uuid::new_v4().simple());
-    run_hook(
-        "bind",
-        serde_json::json!({
-            "session_id": host_session,
-            "tool_response": serde_json::json!({
-                "instance_id": manager.instance_id(),
-                "session_id": session_id,
-                "control_port": manager.port()
-            })
-        }),
-    );
-    let control_path = runtime::runtime_root_path()
-        .unwrap()
-        .join(&instance_id)
-        .join(format!("{session_id}.control"));
-    let ticket_path = runtime::background_task_ticket_path(&instance_id, &session_id).unwrap();
-    assert!(control_path.is_file());
-    assert!(ticket_path.is_file());
-
-    let attached_id = session_id.clone();
-    let background =
-        tokio::spawn(async move { background_task::run(&instance_id, &attached_id).await });
-    let output = wait_for_output(&manager, &session_id, "NATURAL_EXIT_OK").await;
-    assert!(output.contains("NATURAL_EXIT_OK"));
-    background.await.unwrap().unwrap();
-    wait_for_state(&manager, &session_id, SessionState::Finished).await;
-
-    let snapshot = manager.snapshots(Some(&session_id)).unwrap().remove(0);
-    let termination = snapshot.termination.unwrap();
-    assert_eq!(termination.reason, FinishReason::NaturalExit);
-    assert_eq!(termination.exit_code, Some(0));
-    assert!(!control_path.exists());
-    assert!(!ticket_path.exists());
-    let scan = runtime::read_ownership(&host_session).unwrap();
-    assert!(scan.entries.is_empty());
-    assert!(scan.errors.is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn background_task_disconnect_finishes_process_tree() {
-    let manager = Manager::new().await.unwrap();
-    let (session_id, _) = manager
-        .create(long_running_spec(), Duration::from_secs(30))
-        .unwrap();
-    let instance_id = manager.instance_id().to_string();
-    let attached_id = session_id.clone();
-    let background =
-        tokio::spawn(async move { background_task::run(&instance_id, &attached_id).await });
-    wait_for_output(&manager, &session_id, "READY").await;
-
-    background.abort();
-    assert!(background.await.unwrap_err().is_cancelled());
-    wait_for_state(&manager, &session_id, SessionState::Finished).await;
-    let snapshot = manager.snapshots(Some(&session_id)).unwrap().remove(0);
-    assert_eq!(
-        snapshot.termination.unwrap().reason,
-        FinishReason::BackgroundTaskDisconnected
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn disconnect_force_kills_a_signal_ignoring_process() {
-    let manager = Manager::new().await.unwrap();
-    let spec = default_spec(
-        "/bin/sh".into(),
-        vec![
-            "-c".into(),
-            "trap '' HUP TERM; printf 'PID=%s\\n' $$; sleep 30".into(),
-        ],
-        std::env::current_dir().unwrap(),
-    );
-    let (session_id, _) = manager.create(spec, Duration::from_secs(30)).unwrap();
-    let instance_id = manager.instance_id().to_string();
-    let attached_id = session_id.clone();
-    let background =
-        tokio::spawn(async move { background_task::run(&instance_id, &attached_id).await });
-    let output = wait_for_output(&manager, &session_id, "PID=").await;
-    let pid = output
-        .split("PID=")
-        .nth(1)
-        .unwrap()
-        .lines()
-        .next()
-        .unwrap()
-        .trim()
-        .parse::<i32>()
-        .unwrap();
-
-    background.abort();
-    let _ = background.await;
-    wait_for_state(&manager, &session_id, SessionState::Finished).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
-        if !alive {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "process {pid} survived"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    #[cfg(windows)]
+    {
+        StartSpec::new(
+            "cmd.exe",
+            vec!["/C".into(), script.into()],
+            std::env::current_dir().unwrap(),
+        )
     }
 }
-
-fn run_hook(command: &str, input: serde_json::Value) {
+fn long_running() -> StartSpec {
+    #[cfg(unix)]
+    {
+        command("printf READY; sleep 30")
+    }
+    #[cfg(windows)]
+    {
+        command("echo READY & ping -n 30 127.0.0.1 >NUL")
+    }
+}
+fn marker() -> StartSpec {
+    #[cfg(unix)]
+    {
+        command("printf NATURAL_EXIT_OK")
+    }
+    #[cfg(windows)]
+    {
+        command("echo NATURAL_EXIT_OK")
+    }
+}
+async fn finished(entry: &pty_bridge::manager::Entry) {
+    tokio::time::timeout(Duration::from_secs(6), entry.session.wait())
+        .await
+        .unwrap();
+}
+fn hook(command: &str, input: Value) -> Value {
     let mut child = Command::new(env!("CARGO_BIN_EXE_pty-bridge"))
         .args(["hook", command])
         .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .spawn()
         .unwrap();
     child
         .stdin
         .take()
         .unwrap()
-        .write_all(serde_json::to_string(&input).unwrap().as_bytes())
+        .write_all(input.to_string().as_bytes())
         .unwrap();
-    assert!(child.wait().unwrap().success());
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    if output.stdout.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
 }
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn session_end_hook_finishes_owned_session() {
+async fn wait_connection(manager: &Manager, id: &str) -> BufReader<TcpStream> {
+    let mut stream = BufReader::new(
+        TcpStream::connect(("127.0.0.1", manager.port()))
+            .await
+            .unwrap(),
+    );
+    send(
+        stream.get_mut(),
+        &json!({"action":"wait","instance_id":manager.instance_id(),"session_id":id}),
+    )
+    .await
+    .unwrap();
+    let ack: Value = receive(&mut stream).await.unwrap();
+    assert_eq!(ack["ok"], true);
+    stream
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_is_real_and_late_bgshell_replays_terminal_result() {
+    let monitor = Monitor::start().await;
     let manager = Manager::new().await.unwrap();
-    let (session_id, _) = manager
-        .create(long_running_spec(), Duration::from_secs(30))
-        .unwrap();
-    let host_session = format!("host_{}", uuid::Uuid::new_v4().simple());
-    run_hook(
-        "bind",
-        serde_json::json!({
-            "session_id": host_session,
-            "tool_response": serde_json::json!({
-                "instance_id": manager.instance_id(),
-                "session_id": session_id,
-                "control_port": manager.port()
-            }).to_string()
-        }),
-    );
-
-    let instance_id = manager.instance_id().to_string();
-    let attached_id = session_id.clone();
-    let background =
-        tokio::spawn(async move { background_task::run(&instance_id, &attached_id).await });
-    wait_for_state(&manager, &session_id, SessionState::Running).await;
-    run_hook("cleanup", serde_json::json!({ "session_id": host_session }));
-
-    wait_for_state(&manager, &session_id, SessionState::Finished).await;
-    let snapshot = manager.snapshots(Some(&session_id)).unwrap().remove(0);
+    let entry = manager.start(&monitor.host, marker()).await.unwrap();
+    finished(&entry).await;
     assert_eq!(
-        snapshot.termination.unwrap().reason,
-        FinishReason::HostSessionEnded
+        wait::run(manager.instance_id(), &entry.id, manager.port())
+            .await
+            .unwrap(),
+        0
     );
-    background.await.unwrap().unwrap();
-    let scan = runtime::read_ownership(&host_session).unwrap();
-    assert!(scan.entries.is_empty());
-    assert!(scan.errors.is_empty());
+    let result = manager
+        .read(&entry.id, 0, 4096, Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(
+        result["output"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("NATURAL_EXIT_OK")
+    );
+    assert!(entry.snapshot().get("tail_text").is_none());
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(runtime::read_ownership(&monitor.host).unwrap().is_empty());
 }
-
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nonzero_result_fails_bgshell_and_spawn_failure_is_direct() {
+    let monitor = Monitor::start().await;
+    let manager = Manager::new().await.unwrap();
+    let entry = manager
+        .start(&monitor.host, command("exit 7"))
+        .await
+        .unwrap();
+    assert_eq!(
+        wait::run(manager.instance_id(), &entry.id, manager.port())
+            .await
+            .unwrap(),
+        1
+    );
+    let spec = StartSpec::new(
+        "pty-bridge-nonexistent-program",
+        vec![],
+        std::env::current_dir().unwrap(),
+    );
+    assert!(manager.start(&monitor.host, spec).await.is_err());
+    assert_eq!(manager.snapshots(None).unwrap().len(), 1);
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn monitor_disconnect_cleans_every_owned_pty_but_not_other_hosts() {
+    let mut first = Monitor::start().await;
+    let second = Monitor::start().await;
+    let manager = Manager::new().await.unwrap();
+    let a = manager.start(&first.host, long_running()).await.unwrap();
+    let b = manager.start(&first.host, long_running()).await.unwrap();
+    let c = manager.start(&second.host, long_running()).await.unwrap();
+    let instance = manager.instance_id().to_string();
+    let id = a.id.clone();
+    let port = manager.port();
+    let background = tokio::spawn(async move { wait::run(&instance, &id, port).await });
+    first.kill();
+    finished(&a).await;
+    finished(&b).await;
+    assert_eq!(
+        a.snapshot()["termination"]["reason"],
+        "monitor_disconnected"
+    );
+    assert_eq!(background.await.unwrap().unwrap(), 1);
+    assert_eq!(c.session.snapshot().state, SessionState::Running);
+    manager.close(&c.id).unwrap();
+    finished(&c).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bgshell_disconnect_terminates_only_its_pty() {
+    let monitor = Monitor::start().await;
+    let manager = Manager::new().await.unwrap();
+    let a = manager.start(&monitor.host, long_running()).await.unwrap();
+    let b = manager.start(&monitor.host, long_running()).await.unwrap();
+    let stream = wait_connection(&manager, &a.id).await;
+    drop(stream);
+    finished(&a).await;
+    assert_eq!(
+        a.snapshot()["termination"]["reason"],
+        "bgshell_disconnected"
+    );
+    assert_eq!(b.session.snapshot().state, SessionState::Running);
+    manager.close(&b.id).unwrap();
+    finished(&b).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_waiter_cannot_displace_the_original() {
+    let monitor = Monitor::start().await;
+    let manager = Manager::new().await.unwrap();
+    let entry = manager.start(&monitor.host, long_running()).await.unwrap();
+    let mut first = wait_connection(&manager, &entry.id).await;
+    assert!(
+        wait::run(manager.instance_id(), &entry.id, manager.port())
+            .await
+            .is_err()
+    );
+    manager.close(&entry.id).unwrap();
+    let result: Value = receive(&mut first).await.unwrap();
+    assert_eq!(result["termination"]["reason"], "explicit_close");
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn monitor_missing_never_creates_a_target() {
+    let manager = Manager::new().await.unwrap();
+    let host = format!("host_{}", uuid::Uuid::new_v4().simple());
+    let error = manager.start(&host, long_running()).await.err().unwrap();
+    assert!(error.to_string().contains("monitor not ready"));
+    assert!(manager.snapshots(None).unwrap().is_empty());
+    assert!(runtime::read_ownership(&host).unwrap().is_empty());
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hooks_inject_owner_acknowledge_read_and_clean_up() {
+    let monitor = Monitor::start().await;
+    let manager = Manager::new().await.unwrap();
+    let input = json!({"program":"sh","args":["-c","echo x"],"env":{"EXAMPLE":"a"},"host_session_id":"incorrect"});
+    let prepared = hook(
+        "prepare",
+        json!({"session_id":monitor.host,"tool_input":input}),
+    );
+    assert_eq!(
+        prepared["hookSpecificOutput"]["updatedInput"]["host_session_id"],
+        monitor.host
+    );
+    assert_eq!(
+        prepared["hookSpecificOutput"]["updatedInput"]["args"],
+        input["args"]
+    );
+    assert!(
+        prepared["hookSpecificOutput"]
+            .get("permissionDecision")
+            .is_none()
+    );
+    let entry = manager.start(&monitor.host, long_running()).await.unwrap();
+    let result = manager
+        .read(&entry.id, 0, 4096, Duration::from_secs(1))
+        .await
+        .unwrap();
+    hook(
+        "observe",
+        json!({"session_id":monitor.host,"tool_response":json!({"structuredContent":result}).to_string()}),
+    );
+    hook("cleanup", json!({"session_id":monitor.host}));
+    finished(&entry).await;
+    assert_eq!(
+        entry.snapshot()["termination"]["reason"],
+        "host_session_ended"
+    );
+    assert!(runtime::read_ownership(&monitor.host).unwrap().is_empty());
+}
 #[cfg(unix)]
 #[test]
-fn session_end_hook_kills_process_group_when_control_server_is_gone() {
-    let host_session = format!("host_{}", uuid::Uuid::new_v4().simple());
-    let instance_id = format!("inst_{}", uuid::Uuid::new_v4().simple());
-    let session_id = format!("pty_{}", uuid::Uuid::new_v4().simple());
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-
+fn session_end_kills_process_tree_without_mcp_server() {
+    use std::os::unix::process::CommandExt;
+    let host = format!("host_{}", uuid::Uuid::new_v4().simple());
     let mut child = Command::new("/bin/sh")
         .args(["-c", "trap '' HUP TERM; sleep 30"])
         .process_group(0)
         .spawn()
         .unwrap();
-    let process_id = i32::try_from(child.id()).unwrap();
-    runtime::write_ownership(&Ownership {
-        host_session_id: host_session.clone(),
-        instance_id: instance_id.clone(),
-        session_id: session_id.clone(),
+    let pid = child.id() as i32;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let record = runtime::Ownership {
+        host_session_id: host.clone(),
+        instance_id: "inst_fallback".into(),
+        session_id: "pty_fallback".into(),
         port,
-    })
-    .unwrap();
-    runtime::write_process_locator(
-        &host_session,
-        &instance_id,
-        &session_id,
-        &ProcessLocator::Unix {
-            process_id,
-            process_group: Some(process_id),
+        process: pty_core::platform::ProcessLocator::Unix {
+            process_id: pid,
+            process_group: Some(pid),
         },
-    )
-    .unwrap();
-    let control_path = runtime::runtime_root_path()
-        .unwrap()
-        .join(&instance_id)
-        .join(format!("{session_id}.control"));
-    runtime::write_control(&ControlRecord {
-        instance_id: instance_id.clone(),
-        session_id: session_id.clone(),
-        port,
-        token: "test-control-token".into(),
-    })
-    .unwrap();
-    let ticket_path = runtime::write_background_task_ticket(&BackgroundTaskTicket {
-        instance_id: instance_id.clone(),
-        session_id: session_id.clone(),
-        port,
-        token: "test-background-token".into(),
-        expires_at_ms: runtime::now_ms() + 60_000,
-    })
-    .unwrap();
-
-    run_hook("cleanup", serde_json::json!({ "session_id": host_session }));
-    let status = child.wait().unwrap();
-    assert!(!status.success());
-    let scan = runtime::read_ownership(&host_session).unwrap();
-    assert!(scan.entries.is_empty());
-    assert!(scan.errors.is_empty());
-    assert!(!control_path.exists());
-    assert!(!ticket_path.exists());
+    };
+    runtime::write_ownership(&record).unwrap();
+    hook("cleanup", json!({"session_id":host}));
+    assert!(!child.wait().unwrap().success());
+    assert!(runtime::read_ownership(&host).unwrap().is_empty());
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn close_during_start_cannot_resurrect_session() {
+async fn concurrent_creation_respects_limit_and_shutdown_reaps_everything() {
+    let monitor = Monitor::start().await;
     let manager = Manager::new().await.unwrap();
-    let mut spec = long_running_spec();
-    for index in 0..10_000 {
-        spec.env.insert(format!("PAD_{index}"), "x".repeat(64));
-    }
-    let (session_id, _) = manager.create(spec, Duration::from_secs(30)).unwrap();
-    let instance_id = manager.instance_id().to_string();
-    let attached_id = session_id.clone();
-    let background =
-        tokio::spawn(async move { background_task::run(&instance_id, &attached_id).await });
-    tokio::task::yield_now().await;
-    manager.close(&session_id).unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let snapshot = manager.snapshots(Some(&session_id)).unwrap().remove(0);
-    assert_eq!(snapshot.state, SessionState::Finished);
-    assert_eq!(
-        snapshot.termination.unwrap().reason,
-        FinishReason::ExplicitClose
-    );
-    let _ = background.await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_create_never_exceeds_session_limit() {
-    let manager = Manager::new().await.unwrap();
-    let mut tasks = Vec::new();
-    for _ in 0..(MAX_SESSIONS * 2) {
+    let mut jobs = vec![];
+    for _ in 0..pty_bridge::MAX_SESSIONS + 8 {
         let manager = Arc::clone(&manager);
-        tasks.push(tokio::spawn(async move {
-            manager.create(marker_spec("LIMIT"), Duration::from_secs(30))
+        let host = monitor.host.clone();
+        jobs.push(tokio::spawn(async move {
+            manager.start(&host, long_running()).await
         }));
     }
-    let mut created = 0;
-    for task in tasks {
-        if task.await.unwrap().is_ok() {
-            created += 1;
+    let mut entries = vec![];
+    let mut failures = vec![];
+    for job in jobs {
+        match job.await.unwrap() {
+            Ok(entry) => entries.push(entry),
+            Err(error) => failures.push(format!("{error:#}")),
         }
     }
-    assert_eq!(created, MAX_SESSIONS);
-    assert_eq!(manager.snapshots(None).unwrap().len(), MAX_SESSIONS);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn start_failure_is_reported_and_finalized() {
-    let manager = Manager::new().await.unwrap();
-    let spec = default_spec(
-        "pty-bridge-command-that-does-not-exist".into(),
-        vec![],
-        std::env::current_dir().unwrap(),
-    );
-    let (session_id, _) = manager.create(spec, Duration::from_secs(30)).unwrap();
-    let instance_id = manager.instance_id().to_string();
-    let attached_id = session_id.clone();
-    let result = background_task::run(&instance_id, &attached_id).await;
-    assert!(result.is_err());
-    wait_for_state(&manager, &session_id, SessionState::Finished).await;
-    let snapshot = manager.snapshots(Some(&session_id)).unwrap().remove(0);
+    assert_eq!(entries.len(), pty_bridge::MAX_SESSIONS, "{failures:?}");
     assert_eq!(
-        snapshot.termination.unwrap().reason,
-        FinishReason::StartFailed
+        manager.snapshots(None).unwrap().len(),
+        pty_bridge::MAX_SESSIONS
     );
+    manager.shutdown();
+    for entry in entries {
+        finished(&entry).await;
+        assert_eq!(entry.snapshot()["termination"]["reason"], "server_shutdown");
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_racing_start_never_leaves_running_session() {
+    let monitor = Monitor::start().await;
+    let manager = Manager::new().await.unwrap();
+    let start = {
+        let manager = manager.clone();
+        let host = monitor.host.clone();
+        tokio::spawn(async move { manager.start(&host, long_running()).await })
+    };
+    tokio::task::yield_now().await;
+    manager.shutdown();
+    if let Ok(entry) = start.await.unwrap() {
+        finished(&entry).await;
+    }
+    for value in manager.snapshots(None).unwrap() {
+        assert_eq!(value["state"], "finished");
+    }
 }

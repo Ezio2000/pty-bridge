@@ -11,6 +11,7 @@ pub struct OutputBuffer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BufferRead {
     pub bytes: Vec<u8>,
+    pub start_cursor: u64,
     pub next_cursor: u64,
     pub dropped_bytes: u64,
 }
@@ -45,6 +46,7 @@ impl OutputBuffer {
         let bytes = self.bytes.iter().skip(offset).take(len).copied().collect();
         BufferRead {
             bytes,
+            start_cursor: effective,
             next_cursor: effective + len as u64,
             dropped_bytes,
         }
