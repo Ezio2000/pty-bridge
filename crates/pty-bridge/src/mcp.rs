@@ -2,7 +2,7 @@ use crate::{
     manager::Manager,
     waiting::{CONDITION_TIMEOUT, UNTIL_IDLE_FALLBACK, WaitOptions},
 };
-use pty_core::StartSpec;
+use pty_core::{StartSpec, keys};
 use regex::RegexBuilder;
 use rmcp::{
     ServerHandler,
@@ -50,7 +50,10 @@ impl PtyServer {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StartRequest {
-    pub program: String,
+    /// Executable to start with args. Give exactly one of program or command.
+    pub program: Option<String>,
+    /// Shell command line run by the login shell ($SHELL -lc; cmd.exe /C on Windows).
+    pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     pub cwd: Option<String>,
@@ -97,7 +100,12 @@ pub enum ReadMode {
 #[serde(deny_unknown_fields)]
 pub struct WriteRequest {
     pub session_id: String,
-    pub text: String,
+    /// UTF-8 input. Give exactly one of text or keys.
+    pub text: Option<String>,
+    /// Named keys written in order as one input: Enter, Tab, Esc, Backspace, Space, Up, Down,
+    /// Left, Right, Home, End, PageUp, PageDown, Insert, Delete, F1-F12 or a single character,
+    /// with optional C-, M- and S- prefixes (C-c, M-x, S-Tab, C-Left).
+    pub keys: Option<Vec<String>>,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -134,7 +142,7 @@ pub struct CloseRequest {
 impl PtyServer {
     #[tool(
         name = "start",
-        description = "Start a real PTY and child immediately, after the session's plugin monitor is ready. Success confirms process creation, not command completion or application readiness. Immediately run background_task.command using background_task.tool with run_in_background=true to register completion/failure notifications. If that call fails or is denied, close the PTY."
+        description = "Start a real PTY and child immediately, after the session's plugin monitor is ready. Give program with args, or a shell command line. The terminal defaults to 40 rows by 120 columns; programs lay out their output to this size, so pass larger rows/cols for wide tables or long lists. Success confirms process creation, not command completion or application readiness. Immediately run background_task.command using background_task.tool with run_in_background=true to register completion/failure notifications. If that call fails or is denied, close the PTY."
     )]
     async fn start(
         &self,
@@ -146,17 +154,23 @@ impl PtyServer {
         let host = req
             .host_session_id
             .ok_or("missing host_session_id; the PTY Bridge PreToolUse hook must be enabled")?;
+        let (program, args) = match (req.program, req.command) {
+            (Some(program), None) => (program, req.args),
+            (None, Some(command)) if req.args.is_empty() => shell_command(command),
+            (None, Some(_)) => return Err("args cannot be combined with command".into()),
+            _ => return Err("provide exactly one of program or command".into()),
+        };
         let spec = StartSpec {
-            program: req.program,
-            args: req.args,
+            program,
+            args,
             cwd: req
                 .cwd
                 .map(PathBuf::from)
                 .or_else(|| std::env::var_os("PTY_BRIDGE_PROJECT_DIR").map(PathBuf::from))
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
             env: req.env,
-            rows: req.rows.unwrap_or(24),
-            cols: req.cols.unwrap_or(80),
+            rows: req.rows.unwrap_or(DEFAULT_ROWS),
+            cols: req.cols.unwrap_or(DEFAULT_COLS),
         };
         let entry = self
             .manager
@@ -227,23 +241,29 @@ impl PtyServer {
     }
     #[tool(
         name = "write",
-        description = "Write UTF-8 input/control bytes through the single writer. Returns confirmed bytes_written and interaction_id, with no terminal output. Success does not prove the input was interpreted as a command. Use read to inspect the result. On partial/uncertain failure do not retry automatically."
+        description = "Write UTF-8 text or named keys through the single writer. Keys use the encoding the application currently expects (for example SS3 arrows in cursor-key mode). Returns confirmed bytes_written and interaction_id, with no terminal output. Success does not prove the input was interpreted as a command. Use read to inspect the result. On partial/uncertain failure do not retry automatically."
     )]
     async fn write(
         &self,
         Parameters(req): Parameters<WriteRequest>,
     ) -> Result<Json<ToolResponse>, String> {
-        if req.text.len() > 64 * 1024 {
-            return Err("text exceeds 65536 UTF-8 bytes".into());
-        }
         let entry = self
             .manager
             .get(&req.session_id)
             .map_err(|e| e.to_string())?;
+        let bytes = match (req.text, req.keys) {
+            (Some(text), None) => text.into_bytes(),
+            (None, Some(keys)) => keys::encode_all(&keys, entry.session.application_cursor())
+                .map_err(|e| e.to_string())?,
+            _ => return Err("provide exactly one of text or keys".into()),
+        };
+        if bytes.len() > 64 * 1024 {
+            return Err("input exceeds 65536 bytes".into());
+        }
         let receipt = entry
             .session
             .writer()
-            .write(req.text.as_bytes())
+            .write(&bytes)
             .await
             .map_err(|e| serde_json::to_string(&e).unwrap())?;
         Ok(response(
@@ -320,21 +340,43 @@ impl PtyServer {
     }
     #[tool(
         name = "close",
-        description = "Abandon and force-stop a PTY. Idempotent; finished output remains readable without requiring close."
+        description = "Abandon and force-stop a PTY, then wait up to 3 seconds for it to finish. Idempotent; finished output remains readable without requiring close."
     )]
-    fn close(
+    async fn close(
         &self,
         Parameters(req): Parameters<CloseRequest>,
     ) -> Result<Json<ToolResponse>, String> {
         self.manager
             .close(&req.session_id)
             .map_err(|e| e.to_string())?;
-        Ok(response(
-            self.manager
-                .get(&req.session_id)
-                .map_err(|e| e.to_string())?
-                .snapshot(),
-        ))
+        let entry = self
+            .manager
+            .get(&req.session_id)
+            .map_err(|e| e.to_string())?;
+        // Finalization publishes the termination after draining output (at most 2 seconds).
+        let _ = tokio::time::timeout(CLOSE_WAIT, entry.session.wait()).await;
+        Ok(response(entry.snapshot()))
+    }
+}
+
+const DEFAULT_ROWS: u16 = 40;
+const DEFAULT_COLS: u16 = 120;
+const CLOSE_WAIT: Duration = Duration::from_secs(3);
+
+/// Runs a command line through the user's login shell.
+fn shell_command(command: String) -> (String, Vec<String>) {
+    #[cfg(not(windows))]
+    {
+        let shell = std::env::var("SHELL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/bin/sh".into());
+        (shell, vec!["-lc".into(), command])
+    }
+    #[cfg(windows)]
+    {
+        let shell = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into());
+        (shell, vec!["/C".into(), command])
     }
 }
 
@@ -407,6 +449,22 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn start_and_write_accept_their_alternative_inputs() {
+        let start: StartRequest =
+            serde_json::from_value(json!({"command":"echo hi | wc -c"})).unwrap();
+        assert!(start.program.is_none() && start.command.is_some());
+        let write: WriteRequest =
+            serde_json::from_value(json!({"session_id":"pty_x","keys":["C-c","Up"]})).unwrap();
+        assert!(write.text.is_none() && write.keys.unwrap().len() == 2);
+    }
+    #[cfg(not(windows))]
+    #[test]
+    fn commands_run_through_a_login_shell() {
+        let (shell, args) = shell_command("ls | head".into());
+        assert!(!shell.is_empty());
+        assert_eq!(args, ["-lc", "ls | head"]);
     }
     #[test]
     fn wait_command_quotes_paths_and_has_no_start_phase() {

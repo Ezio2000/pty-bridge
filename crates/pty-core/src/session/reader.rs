@@ -78,8 +78,21 @@ pub(super) fn reader_loop(
         match reader.read(&mut bytes) {
             Ok(0) => break None,
             Ok(count) => {
-                let (visible, response) = protocol.process(&bytes[..count]);
-                inner.record(true, &visible);
+                // Visible bytes reach the screen before a later query is answered.
+                let mut response = Vec::new();
+                let mut activity = true;
+                for chunk in protocol.process(&bytes[..count]) {
+                    match chunk {
+                        terminal::Chunk::Visible(visible) => {
+                            inner.record(activity, &visible);
+                            activity = false;
+                        }
+                        terminal::Chunk::Query(query) => response.extend(inner.answer(query)),
+                    }
+                }
+                if activity {
+                    inner.record(true, &[]);
+                }
                 if !response.is_empty() && !inner.snapshot().ending {
                     let input = Input {
                         bytes: response,

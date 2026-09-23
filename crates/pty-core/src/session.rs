@@ -126,6 +126,10 @@ impl Inner {
         self.changed();
     }
 
+    fn answer(&self, query: terminal::Query) -> Vec<u8> {
+        query.answer(self.state.lock().unwrap().screen.screen())
+    }
+
     fn shutdown_io(&self) {
         self.writer.lock().unwrap().take();
         // Drop ConPTY outside the state lock while the reader continues draining.
@@ -268,6 +272,11 @@ impl Session {
     }
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.owner.inner.changes.subscribe()
+    }
+    /// Whether the application enabled cursor-key mode, which changes arrow key encoding.
+    pub fn application_cursor(&self) -> bool {
+        let state = self.owner.inner.state.lock().unwrap();
+        state.screen.screen().application_cursor()
     }
     pub fn process_locator(&self) -> ProcessLocator {
         self.owner.inner.process.locator()

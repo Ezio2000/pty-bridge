@@ -18,7 +18,7 @@ pty-bridge MCP application
 
 `pty-core` is a reusable Rust library with no MCP, Claude, hook, schema, or LLM dependency. It exports `Session`, `PtyWriter`, `PtyReader`, `StartSpec`, snapshots, change subscriptions, structured write results, and platform process locators. `Session::start` creates a real process; `writer().write` confirms input bytes; `reader().read` and `read_wait` return independently addressable byte ranges; `reader().read_text` renders a range as plain text and `reader().screen()` returns the emulated screen together with the cursor of the last byte it applied. `Session::wait` is replayable after completion. Holding a reader or writer keeps the public session alive; dropping the last public handle stops its process tree.
 
-The reader never writes to the PTY directly. Terminal responses and user inputs go through one writer queue. Blocking writes hold no lifecycle lock; a separate supervisor can terminate a process tree while input is blocked. macOS/Linux use Unix PTYs and process groups; Windows uses ConPTY and a named Job Object.
+The reader never writes to the PTY directly. It answers device status, cursor position (`CSI 6n`, `CSI ?6n`) and primary device attribute (`CSI c`) queries from the emulated screen after applying every preceding output byte; these responses and user inputs go through one writer queue. `keys::encode` turns named keys into xterm input, following the application's cursor-key mode. Blocking writes hold no lifecycle lock; a separate supervisor can terminate a process tree while input is blocked. macOS/Linux use Unix PTYs and process groups; Windows uses ConPTY and a named Job Object.
 
 ## Requirements and installation
 
@@ -51,13 +51,13 @@ claude --plugin-dir ./packages/plugin
 
 | Tool | Result and behavior |
 |---|---|
-| `start` | Actual process state, PTY ID, and exact bgshell wait command. A rapidly exiting process still has a replayable completion result. |
-| `write` | `bytes_written`, `interaction_id`, lifecycle state; no output text and no output-wait parameter. Inputs are limited to 64 KiB. |
+| `start` | Takes `program` with `args`, or a `command` line run by the login shell (`$SHELL -lc`; `%ComSpec% /C` on Windows). The terminal defaults to 40×120. Returns actual process state, PTY ID, and exact bgshell wait command. A rapidly exiting process still has a replayable completion result. |
+| `write` | Takes UTF-8 `text` or named `keys` (`Enter`, `Up`, `C-c`, `M-x`, `S-Tab`, `C-Left`, `F5`, single characters, …) encoded for the current cursor-key mode. Returns `bytes_written`, `interaction_id`, lifecycle state; no output text and no output-wait parameter. Inputs are limited to 64 KiB. |
 | `read` | Output in the resolved `mode`, actual `start_cursor..next_cursor`, `dropped_bytes`, state and optional silence notice. Default maximum is 64 KiB; `yield_time_ms` is capped at 30 seconds. |
 | `status` | Lifecycle, reason, dimensions, input/output activity timestamps and retained byte range; no terminal body. |
 | `resize` | Changes dimensions without restarting silence observation. |
 | `signal` | `interrupt` writes Ctrl-C; `terminate` and `kill` act on the process tree independently of the writer. |
-| `close` | Idempotently abandons a session. Finished output remains readable. |
+| `close` | Idempotently abandons a session and waits up to 3 seconds for its termination. Finished output remains readable. |
 
 `read` modes:
 

@@ -122,6 +122,46 @@ async fn terminal_queries_use_writer_and_do_not_create_user_interactions() {
 }
 #[cfg(unix)]
 #[tokio::test]
+async fn cursor_and_attribute_queries_answer_from_the_screen_in_order() {
+    let s = Session::start(command(
+        "stty raw -echo; printf '\\n\\nabc\\033[6n\\033[c'; dd bs=1 count=13 2>/dev/null | od -An -tx1",
+    ))
+    .unwrap();
+    assert_eq!(finished(&s).await.reason, FinishReason::NaturalExit);
+    let text = String::from_utf8_lossy(&s.reader().read(0, 4096).bytes).into_owned();
+    let hex: Vec<_> = text.split_whitespace().skip(1).collect();
+    // ESC [ 3 ; 4 R, then ESC [ ? 1 ; 2 c
+    assert_eq!(
+        hex,
+        [
+            "1b", "5b", "33", "3b", "34", "52", "1b", "5b", "3f", "31", "3b", "32", "63"
+        ]
+    );
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn arrow_keys_follow_the_application_cursor_mode() {
+    let s = Session::start(command(
+        "stty raw -echo; printf '\\033[?1hKEYS_READY'; dd bs=1 count=9 2>/dev/null | od -An -tx1",
+    ))
+    .unwrap();
+    output(&s, "KEYS_READY").await;
+    assert!(s.application_cursor());
+    let keys = pty_core::keys::encode_all(&["Up".into(), "C-Left".into()], s.application_cursor());
+    s.writer().write(&keys.unwrap()).await.unwrap();
+    // Up in cursor-key mode is SS3; modified keys keep the CSI form.
+    assert_eq!(finished(&s).await.reason, FinishReason::NaturalExit);
+    let text = String::from_utf8_lossy(&s.reader().read(0, 4096).bytes).into_owned();
+    let hex: Vec<_> = text
+        .rsplit("KEYS_READY")
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .collect();
+    assert_eq!(hex, ["1b", "4f", "41", "1b", "5b", "31", "3b", "35", "44"]);
+}
+#[cfg(unix)]
+#[tokio::test]
 async fn blocked_write_times_out_and_does_not_hold_lifecycle_lock() {
     let s = Session::start(command("stty raw -echo; printf BLOCK_READY; sleep 30")).unwrap();
     output(&s, "BLOCK_READY").await;

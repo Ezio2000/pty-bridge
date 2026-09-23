@@ -1,5 +1,6 @@
 //! Native PTY sessions with independent input, output and lifecycle handles.
 pub mod buffer;
+pub mod keys;
 pub mod platform;
 pub mod render;
 mod session;
