@@ -51,7 +51,7 @@ claude --plugin-dir ./packages/plugin
 
 | Tool | Result and behavior |
 |---|---|
-| `start` | Takes `program` with `args`, or a `command` line run by the login shell (`$SHELL -lc`; `%ComSpec% /C` on Windows). The terminal defaults to 40×120. Returns actual process state, PTY ID, and exact bgshell wait command. A rapidly exiting process still has a replayable completion result. |
+| `start` | Takes `program` with `args`, or a `command` line run by the login shell (`$SHELL -lc`; `%ComSpec% /C` on Windows). The terminal defaults to 40×120. Returns `session_id`, `state`, the exact bgshell wait command as `background_task`, and `termination` only when the process already finished. A rapidly exiting process still has a replayable completion result. |
 | `write` | Takes UTF-8 `text` or named `keys` (`Enter`, `Up`, `C-c`, `M-x`, `S-Tab`, `C-Left`, `F5`, single characters, …) encoded for the current cursor-key mode. Returns `bytes_written`, `interaction_id`, lifecycle state; no output text and no output-wait parameter. Inputs are limited to 64 KiB. |
 | `read` | Output in the resolved `mode`, `next_cursor`, `state`, and only when they carry information: `start_cursor` (differs from the requested cursor), `dropped_bytes`, `termination`, `wait` and a `silence` notice, plus a short `receipt` for the read hook. Default maximum is 64 KiB; `yield_time_ms` is capped at 30 seconds. |
 | `status` | Lifecycle, reason, dimensions, input/output activity timestamps and retained byte range; no terminal body. |

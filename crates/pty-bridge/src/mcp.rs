@@ -180,11 +180,7 @@ impl PtyServer {
                 return Err(error.to_string());
             }
         };
-        Ok(response(
-            json!({"instance_id":self.manager.instance_id(),"control_port":self.manager.port(),"session_id":entry.id,
-            "state":entry.session.snapshot().state,"termination":entry.snapshot()["termination"],
-            "background_task":launch,"next_action":"run_background_task"}),
-        ))
+        Ok(response(start_result(&entry.id, &entry.snapshot(), launch)))
     }
 
     #[tool(
@@ -349,6 +345,16 @@ fn shell_command(command: String) -> (String, Vec<String>) {
     }
 }
 
+/// The instance and port live inside the wait command, so the result omits them.
+fn start_result(session_id: &str, snapshot: &Value, launch: Value) -> Value {
+    let mut result =
+        json!({"session_id": session_id, "state": snapshot["state"], "background_task": launch});
+    if !snapshot["termination"].is_null() {
+        result["termination"] = snapshot["termination"].clone();
+    }
+    result
+}
+
 pub fn wait_launch(instance: &str, session: &str, port: u16) -> anyhow::Result<Value> {
     let exe = std::env::current_exe()?.to_string_lossy().into_owned();
     #[cfg(not(windows))]
@@ -434,6 +440,25 @@ mod tests {
         let (shell, args) = shell_command("ls | head".into());
         assert!(!shell.is_empty());
         assert_eq!(args, ["-lc", "ls | head"]);
+    }
+    #[test]
+    fn start_result_carries_only_what_the_model_acts_on() {
+        let launch = wait_launch("inst_x", "pty_x", 123).unwrap();
+        let running = start_result(
+            "pty_x",
+            &json!({"state":"running","termination":null}),
+            launch.clone(),
+        );
+        assert_eq!(
+            running.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["background_task", "session_id", "state"]
+        );
+        let exited = start_result(
+            "pty_x",
+            &json!({"state":"finished","termination":{"reason":"natural_exit","exit_code":0}}),
+            launch,
+        );
+        assert_eq!(exited["termination"]["reason"], "natural_exit");
     }
     #[test]
     fn wait_command_quotes_paths_and_has_no_start_phase() {
