@@ -1,9 +1,5 @@
-use crate::{
-    manager::Manager,
-    waiting::{CONDITION_TIMEOUT, UNTIL_IDLE_FALLBACK, WaitOptions},
-};
+use crate::{manager::Manager, waiting::WaitOptions};
 use pty_core::{StartSpec, keys};
-use regex::RegexBuilder;
 use rmcp::{
     ServerHandler,
     handler::server::{
@@ -204,35 +200,8 @@ impl PtyServer {
         if max == 0 {
             return Err("max_output_bytes must be greater than zero".into());
         }
-        let until = req
-            .until
-            .as_deref()
-            .map(|pattern| {
-                RegexBuilder::new(pattern)
-                    .multi_line(true)
-                    .size_limit(1 << 20)
-                    .build()
-            })
-            .transpose()
+        let wait = WaitOptions::from_request(req.yield_time_ms, req.idle_ms, req.until.as_deref())
             .map_err(|e| format!("invalid until pattern: {e}"))?;
-        let conditional = until.is_some() || req.idle_ms.is_some();
-        let wait = WaitOptions {
-            timeout: req
-                .yield_time_ms
-                .map(Duration::from_millis)
-                .unwrap_or(if conditional {
-                    CONDITION_TIMEOUT
-                } else {
-                    Duration::ZERO
-                })
-                .min(Duration::from_secs(30)),
-            idle: match req.idle_ms {
-                Some(0) => None,
-                Some(ms) => Some(Duration::from_millis(ms)),
-                None => until.is_some().then_some(UNTIL_IDLE_FALLBACK),
-            },
-            until,
-        };
         self.manager
             .read(&req.session_id, req.cursor, max, req.mode, &wait, &cancel)
             .await

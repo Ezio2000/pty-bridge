@@ -2,7 +2,7 @@
 //! exit, a full read, cancellation or the deadline. A match never implies readiness.
 use crate::mcp::ReadMode;
 use pty_core::{PtyReader, Session, SessionState, render::render_text};
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use serde::Serialize;
 use std::{
     collections::HashSet,
@@ -23,6 +23,42 @@ pub struct WaitOptions {
     pub timeout: Duration,
     pub idle: Option<Duration>,
     pub until: Option<Regex>,
+}
+
+impl WaitOptions {
+    /// Applies the read tool's defaults: `idle_ms: 0` disables quiet detection, `until`
+    /// falls back to `UNTIL_IDLE_FALLBACK`, and a condition defaults the deadline.
+    pub fn from_request(
+        yield_time_ms: Option<u64>,
+        idle_ms: Option<u64>,
+        until: Option<&str>,
+    ) -> Result<Self, regex::Error> {
+        let until = until
+            .map(|pattern| {
+                RegexBuilder::new(pattern)
+                    .multi_line(true)
+                    .size_limit(1 << 20)
+                    .build()
+            })
+            .transpose()?;
+        let default = if until.is_some() || idle_ms.is_some() {
+            CONDITION_TIMEOUT
+        } else {
+            Duration::ZERO
+        };
+        Ok(Self {
+            timeout: yield_time_ms
+                .map(Duration::from_millis)
+                .unwrap_or(default)
+                .min(Duration::from_secs(30)),
+            idle: match idle_ms {
+                Some(0) => None,
+                Some(ms) => Some(Duration::from_millis(ms)),
+                None => until.is_some().then_some(UNTIL_IDLE_FALLBACK),
+            },
+            until,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

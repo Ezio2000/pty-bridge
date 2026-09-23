@@ -20,16 +20,7 @@ fn within(timeout: Duration) -> WaitOptions {
 }
 #[cfg(unix)]
 fn until(timeout_ms: u64, idle_ms: Option<u64>, pattern: Option<&str>) -> WaitOptions {
-    WaitOptions {
-        timeout: Duration::from_millis(timeout_ms),
-        idle: idle_ms.map(Duration::from_millis),
-        until: pattern.map(|p| {
-            regex::RegexBuilder::new(p)
-                .multi_line(true)
-                .build()
-                .unwrap()
-        }),
-    }
+    WaitOptions::from_request(Some(timeout_ms), idle_ms, pattern).unwrap()
 }
 struct Monitor {
     host: String,
