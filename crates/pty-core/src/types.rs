@@ -59,6 +59,7 @@ pub enum FinishReason {
 pub struct Termination {
     pub reason: FinishReason,
     pub exit_code: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
 

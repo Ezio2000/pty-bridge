@@ -159,20 +159,33 @@ fn text_match(
     let prefix = (cursor.saturating_sub(data.start_cursor) as usize).min(data.bytes.len());
     let (text, _) = render_text(&data.bytes, rows, cols);
     let (seen, _) = render_text(&data.bytes[..prefix], rows, cols);
-    let min_end = if text.starts_with(&seen) {
+    new_match(re, &text, &seen).or_else(|| new_match(re, &trim_lines(&text), &trim_lines(&seen)))
+}
+
+fn new_match(re: &Regex, text: &str, seen: &str) -> Option<String> {
+    let min_end = if text.starts_with(seen) {
         seen.len()
     } else {
         0
     };
-    re.find_iter(&text)
+    re.find_iter(text)
         .find(|m| m.end() > min_end)
         .map(|m| m.as_str().to_string())
+}
+
+/// The cursor line keeps its trailing spaces; patterns may be written with or without them.
+fn trim_lines(text: &str) -> String {
+    text.lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn screen_matches(re: &Regex, lines: &[String]) -> HashSet<(usize, String)> {
     lines
         .iter()
         .enumerate()
+        .flat_map(|(row, line)| [line.as_str(), line.trim_end()].map(|line| (row, line)))
         .flat_map(|(row, line)| {
             re.find_iter(line)
                 .map(move |m| (row, m.as_str().to_string()))

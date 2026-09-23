@@ -46,9 +46,18 @@ pub struct TextRead {
 
 pub(crate) fn snapshot(screen: &vt100::Screen, end_cursor: u64) -> ScreenSnapshot {
     let (rows, cols) = screen.size();
+    let (row, col) = screen.cursor_position();
+    // Spaces the program wrote before the cursor, such as after a prompt, are kept.
     let mut lines: Vec<String> = screen
         .rows(0, cols)
-        .map(|line| line.trim_end().to_string())
+        .enumerate()
+        .map(|(index, line)| {
+            if index == usize::from(row) {
+                line
+            } else {
+                line.trim_end().to_string()
+            }
+        })
         .collect();
     while lines.last().is_some_and(String::is_empty) {
         lines.pop();
@@ -67,7 +76,6 @@ pub(crate) fn snapshot(screen: &vt100::Screen, end_cursor: u64) -> ScreenSnapsho
         }
         highlights.extend(run);
     }
-    let (row, col) = screen.cursor_position();
     ScreenSnapshot {
         rows,
         cols,
@@ -99,24 +107,60 @@ pub fn render_text(bytes: &[u8], rows: u16, cols: u16) -> (String, bool) {
         offset -= take;
     }
     screen.set_scrollback(0);
+    let cursor_row = physical.len() + usize::from(screen.cursor_position().0);
     collect(screen, usize::from(rows), &mut physical);
 
+    // Trailing spaces are kept only on the cursor's line, where prompts end.
     let mut lines = Vec::new();
     let mut current = String::new();
-    for (text, wrapped) in physical {
+    let mut keep = false;
+    for (index, (text, wrapped)) in physical.into_iter().enumerate() {
         current.push_str(&text);
+        keep |= index == cursor_row;
         if !wrapped {
-            lines.push(current.trim_end().to_string());
-            current.clear();
+            lines.push(finish(&mut current, keep));
+            keep = false;
         }
     }
     if !current.is_empty() {
-        lines.push(current.trim_end().to_string());
+        lines.push(finish(&mut current, keep));
     }
     while lines.last().is_some_and(String::is_empty) {
         lines.pop();
     }
-    (lines.join("\n"), total >= TEXT_SCROLLBACK)
+    (
+        collapse_blank_runs(lines).join("\n"),
+        total >= TEXT_SCROLLBACK,
+    )
+}
+
+/// Runs of three or more empty lines, typical of cleared or full-screen drawing, become one.
+fn collapse_blank_runs(lines: Vec<String>) -> Vec<String> {
+    let mut compact = Vec::with_capacity(lines.len());
+    let mut blanks = 0;
+    for line in lines {
+        if line.is_empty() {
+            blanks += 1;
+            continue;
+        }
+        compact.extend(std::iter::repeat_n(
+            String::new(),
+            if blanks >= 3 { 1 } else { blanks },
+        ));
+        blanks = 0;
+        compact.push(line);
+    }
+    compact
+}
+
+fn finish(line: &mut String, keep: bool) -> String {
+    let text = if keep {
+        line.clone()
+    } else {
+        line.trim_end().to_string()
+    };
+    line.clear();
+    text
 }
 
 fn collect(screen: &vt100::Screen, take: usize, out: &mut Vec<(String, bool)>) {
@@ -136,7 +180,7 @@ mod tests {
         let bytes = b"\x1b[1;35m>>> \x1b[0m\x1b[4D\x1b[4C\x1b[4D\x1b[1;35m>>> \x1b[0mp\x1b[5D\
 \x1b[1;35m>>> \x1b[0mpr\x1b[6D\x1b[1;35m>>> \x1b[0mprint(1)\x1b[12D\r\n\x1b[?2004lhi\r\n2\r\n>>> ";
         let (text, dropped) = render_text(bytes, 24, 80);
-        assert_eq!(text, ">>> print(1)\nhi\n2\n>>>");
+        assert_eq!(text, ">>> print(1)\nhi\n2\n>>> ");
         assert!(!dropped);
     }
 
@@ -154,6 +198,12 @@ mod tests {
         assert_eq!(lines[49], "line 49");
         assert_eq!(lines[50], "x".repeat(25));
         assert!(!dropped);
+    }
+
+    #[test]
+    fn long_blank_runs_collapse_but_paragraph_breaks_stay() {
+        let (text, _) = render_text(b"a\r\n\r\nb\r\n\r\n\r\n\r\n\r\nc\r\n", 24, 80);
+        assert_eq!(text, "a\n\nb\n\nc");
     }
 
     #[test]

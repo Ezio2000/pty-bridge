@@ -13,7 +13,7 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -101,6 +101,10 @@ impl Entry {
         drop(stored);
         self.session.stop(core, force)
     }
+    /// Read receipts not yet acknowledged by the read hook.
+    pub fn pending_receipts(&self) -> usize {
+        self.observation.lock().unwrap().receipts.len()
+    }
     pub fn termination(&self, termination: Termination) -> Value {
         let core_reason = termination.reason;
         let mut value = serde_json::to_value(termination).unwrap();
@@ -132,6 +136,7 @@ pub struct Manager {
     slots: Arc<Semaphore>,
     monitors: AsyncMutex<HashMap<String, Arc<MonitorLink>>>,
     shutting_down: AtomicBool,
+    receipts: AtomicU64,
     listener_abort: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
@@ -145,6 +150,7 @@ impl Manager {
             slots: Arc::new(Semaphore::new(MAX_SESSIONS)),
             monitors: AsyncMutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
+            receipts: AtomicU64::new(0),
             listener_abort: Mutex::new(None),
         });
         let weak = Arc::downgrade(&manager);
@@ -388,39 +394,52 @@ impl Manager {
             (mode, _) => mode,
         };
         // A screen reflects every byte before its end, so its receipt covers them all.
-        let (receipt_start, start, end, dropped, body) = match mode {
+        let mut result = serde_json::Map::new();
+        let (receipt_start, start, end, dropped) = match mode {
             ReadMode::Screen => {
                 let screen = screen.expect("screen captured for screen mode");
-                let end = screen.end_cursor;
-                (0, cursor.min(end), end, 0, json!({"screen": screen}))
+                let mut view = json!({"lines": screen.lines, "cursor": [screen.cursor.row, screen.cursor.col]});
+                if screen.alternate_screen {
+                    view["alternate_screen"] = json!(true);
+                }
+                if !screen.cursor_visible {
+                    view["cursor_visible"] = json!(false);
+                }
+                if !screen.highlights.is_empty() {
+                    view["highlights"] = json!(screen.highlights);
+                }
+                result.insert("screen".into(), view);
+                (0, cursor.min(screen.end_cursor), screen.end_cursor, 0)
             }
             ReadMode::Raw => {
                 let data = reader.read(cursor, max);
-                let text = std::str::from_utf8(&data.bytes);
-                let mut output = json!({"text": String::from_utf8_lossy(&data.bytes), "text_lossy": text.is_err()});
-                if text.is_err() {
-                    output["base64"] = json!(STANDARD.encode(&data.bytes));
+                result.insert("text".into(), json!(String::from_utf8_lossy(&data.bytes)));
+                if std::str::from_utf8(&data.bytes).is_err() {
+                    result.insert("text_lossy".into(), json!(true));
+                    result.insert("base64".into(), json!(STANDARD.encode(&data.bytes)));
                 }
                 (
                     data.start_cursor,
                     data.start_cursor,
                     data.next_cursor,
                     data.dropped_bytes,
-                    json!({"output": output}),
                 )
             }
             _ => {
                 let data = reader.read_text(cursor, max);
+                result.insert("text".into(), json!(data.text));
+                if data.rows_dropped {
+                    result.insert("rows_dropped".into(), json!(true));
+                }
                 (
                     data.start_cursor,
                     data.start_cursor,
                     data.next_cursor,
                     data.dropped_bytes,
-                    json!({"output": {"text": data.text, "rows_dropped": data.rows_dropped}}),
                 )
             }
         };
-        let receipt = format!("read_{}", uuid::Uuid::new_v4().simple());
+        let receipt = format!("r{}", self.receipts.fetch_add(1, Ordering::Relaxed) + 1);
         let notice = {
             let mut observation = entry.observation.lock().unwrap();
             let notice = observation.candidate(&entry.session.snapshot());
@@ -436,16 +455,31 @@ impl Manager {
             }
             notice
         };
+        // Only fields the model acts on; the read hook resolves the owner from runtime records.
         let snapshot = entry.snapshot();
-        let mut result = json!({"instance_id":self.instance,"control_port":self.port,"session_id":id,"receipt_id":receipt,
-            "mode":mode,"start_cursor":start,"next_cursor":end,"dropped_bytes":dropped,
-            "state":snapshot["state"],"termination":snapshot["termination"],
-            "silence":notice.map(|candidate|json!({"candidate":candidate,"message":format!("PTY {id} 疑似停滞，请调用 read 检查。")}))});
-        let fields = result.as_object_mut().unwrap();
-        fields.extend(body.as_object().unwrap().clone());
-        if let Some(waited) = waited {
-            fields.insert("wait".into(), json!(waited));
+        result.insert("mode".into(), json!(mode));
+        result.insert("next_cursor".into(), json!(end));
+        if start != cursor {
+            result.insert("start_cursor".into(), json!(start));
         }
+        if dropped > 0 {
+            result.insert("dropped_bytes".into(), json!(dropped));
+        }
+        result.insert("state".into(), snapshot["state"].clone());
+        if !snapshot["termination"].is_null() {
+            result.insert("termination".into(), snapshot["termination"].clone());
+        }
+        if let Some(waited) = waited {
+            result.insert("wait".into(), json!(waited));
+        }
+        if notice.is_some() {
+            result.insert(
+                "silence".into(),
+                json!(format!("PTY {id} 疑似停滞，请调用 read 检查。")),
+            );
+        }
+        result.insert("receipt".into(), json!(receipt));
+        let result = Value::Object(result);
         Ok(result)
     }
 

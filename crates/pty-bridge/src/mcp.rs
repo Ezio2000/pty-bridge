@@ -82,7 +82,7 @@ pub struct ReadRequest {
     /// Return once new output has been quiet this long. With until it defaults to 5000; 0 disables it.
     pub idle_ms: Option<u64>,
     /// Regex (multi-line) returning as soon as it matches new output: rendered text after cursor,
-    /// or a screen row that was not already matching. Trailing spaces are trimmed before matching.
+    /// or a screen row that was not already matching. A pattern may include or omit spaces after a prompt.
     pub until: Option<String>,
 }
 #[derive(
@@ -193,7 +193,7 @@ impl PtyServer {
 
     #[tool(
         name = "read",
-        description = "Read terminal output; this is the only tool returning it. Pass the previous next_cursor as cursor. text mode returns new output as plain text; screen mode returns the whole current screen (use it for menus, full-screen programs and prompts redrawn in place); auto picks screen for full-screen programs, else text. start_cursor..next_cursor is the covered byte range; dropped_bytes were lost, not read. Without idle_ms or until, waits up to yield_time_ms (maximum 30000) for the first output beyond cursor. idle_ms returns once new output goes quiet; until returns as soon as a regex matches new output, falling back to 5 s of quiet. wait.reason reports matched, idle, output, exited, limit, timeout or cancelled; a match does not prove the program is ready. An empty read does not reset silence detection."
+        description = "Read terminal output; this is the only tool returning it. Pass the previous next_cursor as cursor. text mode returns new output as plain text in text; screen mode returns the whole current screen as screen.lines with cursor [row, col] (use it for menus, full-screen programs and prompts redrawn in place); auto picks screen for full-screen programs, else text. start_cursor (only when it differs from cursor) and dropped_bytes (only when nonzero) report output lost before it was read. Without idle_ms or until, waits up to yield_time_ms (maximum 30000) for the first output beyond cursor. idle_ms returns once new output goes quiet; until returns as soon as a regex matches new output, falling back to 5 s of quiet. wait.reason reports matched, idle, output, exited, limit, timeout or cancelled; a match does not prove the program is ready. An empty read does not reset silence detection."
     )]
     async fn read(
         &self,

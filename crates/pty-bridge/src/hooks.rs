@@ -40,15 +40,20 @@ pub fn prepare_from_stdin() -> Result<()> {
 pub async fn observe_from_stdin() -> Result<()> {
     let input = input()?;
     let response = parse_response(input.tool_response)?;
-    if response.get("receipt_id").is_none() {
+    let Some(receipt) = response.get("receipt").and_then(Value::as_str) else {
         return Ok(());
-    }
-    let port = response["control_port"]
-        .as_u64()
-        .and_then(|p| u16::try_from(p).ok())
-        .filter(|p| *p > 0)
-        .context("invalid control_port")?;
-    control(port,json!({"action":"observe","instance_id":response["instance_id"],"session_id":response["session_id"],"receipt_id":response["receipt_id"]})).await
+    };
+    let session = input.tool_input["session_id"]
+        .as_str()
+        .context("read input has no session_id")?;
+    // A finished session has no ownership record and no pending silence to acknowledge.
+    let Some(record) = runtime::read_ownership(&input.session_id)?
+        .into_iter()
+        .find(|record| record.session_id == session)
+    else {
+        return Ok(());
+    };
+    control(record.port,json!({"action":"observe","instance_id":record.instance_id,"session_id":session,"receipt_id":receipt})).await
 }
 
 pub async fn cleanup_from_stdin() -> Result<()> {
@@ -125,8 +130,7 @@ mod tests {
     use super::*;
     #[test]
     fn reads_actual_structured_and_text_mcp_results() {
-        let result =
-            json!({"session_id":"pty_x","receipt_id":"read_1","start_cursor":3,"next_cursor":5});
+        let result = json!({"receipt":"r1","next_cursor":5});
         for response in [
             json!({"structuredContent":result}).to_string().into(),
             json!({"content":[{"type":"text","text":result.to_string()}]}),

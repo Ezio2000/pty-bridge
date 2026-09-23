@@ -18,6 +18,7 @@ fn within(timeout: Duration) -> WaitOptions {
         until: None,
     }
 }
+#[cfg(unix)]
 fn until(timeout_ms: u64, idle_ms: Option<u64>, pattern: Option<&str>) -> WaitOptions {
     WaitOptions {
         timeout: Duration::from_millis(timeout_ms),
@@ -164,12 +165,7 @@ async fn start_is_real_and_late_bgshell_replays_terminal_result() {
         )
         .await
         .unwrap();
-    assert!(
-        result["output"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("NATURAL_EXIT_OK")
-    );
+    assert!(result["text"].as_str().unwrap().contains("NATURAL_EXIT_OK"));
     assert!(entry.snapshot().get("tail_text").is_none());
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(runtime::read_ownership(&monitor.host).unwrap().is_empty());
@@ -295,10 +291,13 @@ async fn hooks_inject_owner_acknowledge_read_and_clean_up() {
         )
         .await
         .unwrap();
+    assert_eq!(entry.pending_receipts(), 1);
+    assert!(result.get("control_port").is_none() && result.get("instance_id").is_none());
     hook(
         "observe",
-        json!({"session_id":monitor.host,"tool_response":json!({"structuredContent":result}).to_string()}),
+        json!({"session_id":monitor.host,"tool_input":{"session_id":entry.id},"tool_response":json!({"structuredContent":result}).to_string()}),
     );
+    assert_eq!(entry.pending_receipts(), 0);
     hook("cleanup", json!({"session_id":monitor.host}));
     finished(&entry).await;
     assert_eq!(
@@ -409,8 +408,8 @@ async fn read_modes_render_text_and_full_screen_programs() {
         .await
         .unwrap();
     assert_eq!(text["mode"], "text");
-    assert_eq!(text["output"]["text"], "ac!");
-    assert!(text["output"].get("base64").is_none());
+    assert_eq!(text["text"], "ac!");
+    assert!(text.get("base64").is_none());
     let cursor = text["next_cursor"].as_u64().unwrap();
     let screen = manager
         .read(
@@ -441,12 +440,7 @@ async fn read_modes_render_text_and_full_screen_programs() {
         )
         .await
         .unwrap();
-    assert!(
-        raw["output"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("\u{1b}[?1049h")
-    );
+    assert!(raw["text"].as_str().unwrap().contains("\u{1b}[?1049h"));
     manager.close(&entry.id).unwrap();
     finished(&entry).await;
 }
@@ -494,6 +488,17 @@ async fn read_waits_for_patterns_quiet_output_exit_and_cancellation() {
     )
     .await;
     assert_eq!(r["wait"]["reason"], "matched");
+    for pattern in ["word: $", "word:$"] {
+        let r = read(
+            prompt.id.clone(),
+            4,
+            ReadMode::Auto,
+            until(0, Some(0), Some(pattern)),
+            none.clone(),
+        )
+        .await;
+        assert_eq!(r["wait"]["reason"], "matched", "{pattern}");
+    }
     let r = read(
         prompt.id.clone(),
         end,
@@ -521,7 +526,7 @@ async fn read_waits_for_patterns_quiet_output_exit_and_cancellation() {
     )
     .await;
     assert_eq!(r["wait"]["reason"], "idle");
-    assert_eq!(r["output"]["text"], "ab");
+    assert_eq!(r["text"], "ab");
     let r = read(
         quiet.id.clone(),
         0,
@@ -605,6 +610,15 @@ async fn read_waits_for_patterns_quiet_output_exit_and_cancellation() {
     .await;
     assert_eq!(r["wait"]["reason"], "matched");
     assert_eq!(r["mode"], "screen");
+    let r = read(
+        screen.id.clone(),
+        end,
+        ReadMode::Auto,
+        until(3000, Some(0), Some(">>> $")),
+        none.clone(),
+    )
+    .await;
+    assert_eq!(r["wait"]["reason"], "matched");
 
     for entry in [&prompt, &quiet, &silent, &screen] {
         manager.close(&entry.id).unwrap();

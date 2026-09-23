@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "pty-bridge",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "Interactive PTY writer/reader with native completion tasks and a persistent silence monitor",
   "author": {
     "name": "ezio2000"
