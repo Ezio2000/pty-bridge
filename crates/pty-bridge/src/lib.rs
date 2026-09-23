@@ -6,4 +6,5 @@ pub mod protocol;
 pub mod runtime;
 pub mod silence;
 pub mod wait;
+pub mod waiting;
 pub const MAX_SESSIONS: usize = 64;

@@ -1,5 +1,9 @@
-use crate::manager::Manager;
+use crate::{
+    manager::Manager,
+    waiting::{CONDITION_TIMEOUT, UNTIL_IDLE_FALLBACK, WaitOptions},
+};
 use pty_core::StartSpec;
+use regex::RegexBuilder;
 use rmcp::{
     ServerHandler,
     handler::server::{
@@ -12,6 +16,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use tokio_util::sync::CancellationToken;
 
 /// MCP requires an object at the root of every output schema.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -69,7 +74,13 @@ pub struct ReadRequest {
     #[serde(default)]
     pub mode: ReadMode,
     pub max_output_bytes: Option<usize>,
+    /// Maximum wait in milliseconds (capped at 30000). Defaults to 0, or 10000 with idle_ms or until.
     pub yield_time_ms: Option<u64>,
+    /// Return once new output has been quiet this long. With until it defaults to 5000; 0 disables it.
+    pub idle_ms: Option<u64>,
+    /// Regex (multi-line) returning as soon as it matches new output: rendered text after cursor,
+    /// or a screen row that was not already matching. Trailing spaces are trimmed before matching.
+    pub until: Option<String>,
 }
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
@@ -168,24 +179,48 @@ impl PtyServer {
 
     #[tool(
         name = "read",
-        description = "Read terminal output; this is the only tool returning it. Pass the previous next_cursor as cursor. text mode returns new output as plain text; screen mode returns the whole current screen (use it for menus, full-screen programs and prompts redrawn in place); auto picks screen for full-screen programs, else text. start_cursor..next_cursor is the covered byte range; dropped_bytes were lost, not read. Waits up to yield_time_ms (maximum 30000) for output beyond cursor. An empty read does not reset silence detection."
+        description = "Read terminal output; this is the only tool returning it. Pass the previous next_cursor as cursor. text mode returns new output as plain text; screen mode returns the whole current screen (use it for menus, full-screen programs and prompts redrawn in place); auto picks screen for full-screen programs, else text. start_cursor..next_cursor is the covered byte range; dropped_bytes were lost, not read. Without idle_ms or until, waits up to yield_time_ms (maximum 30000) for the first output beyond cursor. idle_ms returns once new output goes quiet; until returns as soon as a regex matches new output, falling back to 5 s of quiet. wait.reason reports matched, idle, output, exited, limit, timeout or cancelled; a match does not prove the program is ready. An empty read does not reset silence detection."
     )]
     async fn read(
         &self,
         Parameters(req): Parameters<ReadRequest>,
+        cancel: CancellationToken,
     ) -> Result<Json<ToolResponse>, String> {
         let max = req.max_output_bytes.unwrap_or(64 * 1024).min(1024 * 1024);
         if max == 0 {
             return Err("max_output_bytes must be greater than zero".into());
         }
+        let until = req
+            .until
+            .as_deref()
+            .map(|pattern| {
+                RegexBuilder::new(pattern)
+                    .multi_line(true)
+                    .size_limit(1 << 20)
+                    .build()
+            })
+            .transpose()
+            .map_err(|e| format!("invalid until pattern: {e}"))?;
+        let conditional = until.is_some() || req.idle_ms.is_some();
+        let wait = WaitOptions {
+            timeout: req
+                .yield_time_ms
+                .map(Duration::from_millis)
+                .unwrap_or(if conditional {
+                    CONDITION_TIMEOUT
+                } else {
+                    Duration::ZERO
+                })
+                .min(Duration::from_secs(30)),
+            idle: match req.idle_ms {
+                Some(0) => None,
+                Some(ms) => Some(Duration::from_millis(ms)),
+                None => until.is_some().then_some(UNTIL_IDLE_FALLBACK),
+            },
+            until,
+        };
         self.manager
-            .read(
-                &req.session_id,
-                req.cursor,
-                max,
-                Duration::from_millis(req.yield_time_ms.unwrap_or(0).min(30000)),
-                req.mode,
-            )
+            .read(&req.session_id, req.cursor, max, req.mode, &wait, &cancel)
             .await
             .map(response)
             .map_err(|e| e.to_string())

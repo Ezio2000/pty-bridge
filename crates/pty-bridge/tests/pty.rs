@@ -1,5 +1,5 @@
 use pty_bridge::protocol::{receive, send};
-use pty_bridge::{manager::Manager, mcp::ReadMode, runtime, wait};
+use pty_bridge::{manager::Manager, mcp::ReadMode, runtime, wait, waiting::WaitOptions};
 use pty_core::{SessionState, StartSpec};
 use serde_json::{Value, json};
 use std::{
@@ -9,7 +9,27 @@ use std::{
     time::Duration,
 };
 use tokio::{io::BufReader, net::TcpStream};
+use tokio_util::sync::CancellationToken;
 
+fn within(timeout: Duration) -> WaitOptions {
+    WaitOptions {
+        timeout,
+        idle: None,
+        until: None,
+    }
+}
+fn until(timeout_ms: u64, idle_ms: Option<u64>, pattern: Option<&str>) -> WaitOptions {
+    WaitOptions {
+        timeout: Duration::from_millis(timeout_ms),
+        idle: idle_ms.map(Duration::from_millis),
+        until: pattern.map(|p| {
+            regex::RegexBuilder::new(p)
+                .multi_line(true)
+                .build()
+                .unwrap()
+        }),
+    }
+}
 struct Monitor {
     host: String,
     child: std::process::Child,
@@ -134,7 +154,14 @@ async fn start_is_real_and_late_bgshell_replays_terminal_result() {
         0
     );
     let result = manager
-        .read(&entry.id, 0, 4096, Duration::ZERO, ReadMode::Auto)
+        .read(
+            &entry.id,
+            0,
+            4096,
+            ReadMode::Auto,
+            &within(Duration::ZERO),
+            &CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert!(
@@ -258,7 +285,14 @@ async fn hooks_inject_owner_acknowledge_read_and_clean_up() {
     );
     let entry = manager.start(&monitor.host, long_running()).await.unwrap();
     let result = manager
-        .read(&entry.id, 0, 4096, Duration::from_secs(1), ReadMode::Auto)
+        .read(
+            &entry.id,
+            0,
+            4096,
+            ReadMode::Auto,
+            &within(Duration::from_secs(1)),
+            &CancellationToken::new(),
+        )
         .await
         .unwrap();
     hook(
@@ -364,7 +398,14 @@ async fn read_modes_render_text_and_full_screen_programs() {
         .await
         .unwrap();
     let text = manager
-        .read(&entry.id, 0, 4096, Duration::from_secs(1), ReadMode::Auto)
+        .read(
+            &entry.id,
+            0,
+            4096,
+            ReadMode::Auto,
+            &within(Duration::from_secs(1)),
+            &CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(text["mode"], "text");
@@ -376,8 +417,9 @@ async fn read_modes_render_text_and_full_screen_programs() {
             &entry.id,
             cursor,
             4096,
-            Duration::from_secs(2),
             ReadMode::Auto,
+            &within(Duration::from_secs(2)),
+            &CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -389,7 +431,14 @@ async fn read_modes_render_text_and_full_screen_programs() {
         json!([{"row":1,"col":2,"len":3}])
     );
     let raw = manager
-        .read(&entry.id, 0, 4096, Duration::ZERO, ReadMode::Raw)
+        .read(
+            &entry.id,
+            0,
+            4096,
+            ReadMode::Raw,
+            &within(Duration::ZERO),
+            &CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert!(
@@ -400,4 +449,164 @@ async fn read_modes_render_text_and_full_screen_programs() {
     );
     manager.close(&entry.id).unwrap();
     finished(&entry).await;
+}
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_waits_for_patterns_quiet_output_exit_and_cancellation() {
+    let monitor = Monitor::start().await;
+    let manager = Manager::new().await.unwrap();
+    let none = CancellationToken::new();
+    let read = |id: String, cursor, mode, options: WaitOptions, cancel: CancellationToken| {
+        let manager = manager.clone();
+        async move {
+            manager
+                .read(&id, cursor, 4096, mode, &options, &cancel)
+                .await
+                .unwrap()
+        }
+    };
+
+    // A prompt split across writes matches from its line start; a seen prompt does not.
+    let prompt = manager
+        .start(
+            &monitor.host,
+            command("printf Pass; sleep 0.2; printf 'word: '; sleep 30"),
+        )
+        .await
+        .unwrap();
+    let r = read(
+        prompt.id.clone(),
+        0,
+        ReadMode::Auto,
+        until(3000, None, Some("[Pp]assword:")),
+        none.clone(),
+    )
+    .await;
+    assert_eq!(r["wait"]["reason"], "matched");
+    assert_eq!(r["wait"]["matched"], "Password:");
+    let end = r["next_cursor"].as_u64().unwrap();
+    let r = read(
+        prompt.id.clone(),
+        4,
+        ReadMode::Auto,
+        until(0, Some(0), Some("[Pp]assword:")),
+        none.clone(),
+    )
+    .await;
+    assert_eq!(r["wait"]["reason"], "matched");
+    let r = read(
+        prompt.id.clone(),
+        end,
+        ReadMode::Auto,
+        until(300, Some(0), Some("[Pp]assword:")),
+        none.clone(),
+    )
+    .await;
+    assert_eq!(r["wait"]["reason"], "timeout");
+
+    // Quiet output ends an explicit idle wait and an unmatched pattern wait.
+    let quiet = manager
+        .start(
+            &monitor.host,
+            command("printf a; sleep 0.2; printf b; sleep 30"),
+        )
+        .await
+        .unwrap();
+    let r = read(
+        quiet.id.clone(),
+        0,
+        ReadMode::Auto,
+        until(5000, Some(400), None),
+        none.clone(),
+    )
+    .await;
+    assert_eq!(r["wait"]["reason"], "idle");
+    assert_eq!(r["output"]["text"], "ab");
+    let r = read(
+        quiet.id.clone(),
+        0,
+        ReadMode::Auto,
+        until(5000, Some(100), Some("never")),
+        none.clone(),
+    )
+    .await;
+    assert_eq!(r["wait"]["reason"], "idle");
+
+    // Exit ends a pattern wait; cancellation ends a silent one early.
+    let exits = manager
+        .start(&monitor.host, command("sleep 0.2; printf done"))
+        .await
+        .unwrap();
+    let r = read(
+        exits.id.clone(),
+        0,
+        ReadMode::Auto,
+        until(5000, Some(0), Some("never")),
+        none.clone(),
+    )
+    .await;
+    assert_eq!(r["wait"]["reason"], "exited");
+    let cancel = CancellationToken::new();
+    let trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        trigger.cancel();
+    });
+    let silent = manager
+        .start(&monitor.host, command("sleep 30"))
+        .await
+        .unwrap();
+    let r = read(
+        silent.id.clone(),
+        0,
+        ReadMode::Auto,
+        until(5000, Some(0), Some("never")),
+        cancel,
+    )
+    .await;
+    assert_eq!(r["wait"]["reason"], "cancelled");
+    assert!(r["wait"]["waited_ms"].as_u64().unwrap() < 2000);
+
+    // Screen rows already matching before the wait are not new matches.
+    let screen = manager
+        .start(
+            &monitor.host,
+            command("printf '\\033[?1049h>>> '; read x; printf '\\r\\n>>> '; sleep 30"),
+        )
+        .await
+        .unwrap();
+    let r = read(
+        screen.id.clone(),
+        0,
+        ReadMode::Auto,
+        until(3000, None, Some(">>>")),
+        none.clone(),
+    )
+    .await;
+    assert_eq!(r["wait"]["reason"], "matched");
+    let end = r["next_cursor"].as_u64().unwrap();
+    let r = read(
+        screen.id.clone(),
+        end,
+        ReadMode::Auto,
+        until(300, Some(0), Some(">>>$")),
+        none.clone(),
+    )
+    .await;
+    assert_eq!(r["wait"]["reason"], "timeout");
+    screen.session.writer().write(b"a\n").await.unwrap();
+    let r = read(
+        screen.id.clone(),
+        end,
+        ReadMode::Auto,
+        until(3000, Some(0), Some(">>>$")),
+        none.clone(),
+    )
+    .await;
+    assert_eq!(r["wait"]["reason"], "matched");
+    assert_eq!(r["mode"], "screen");
+
+    for entry in [&prompt, &quiet, &silent, &screen] {
+        manager.close(&entry.id).unwrap();
+    }
 }

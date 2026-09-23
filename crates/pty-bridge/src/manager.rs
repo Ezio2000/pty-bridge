@@ -4,6 +4,7 @@ use crate::{
     protocol::{receive, send},
     runtime::{self, Ownership},
     silence::{Candidate, Observation},
+    waiting::{self, WaitOptions},
 };
 use anyhow::{Context, Result, bail};
 use pty_core::{FinishReason, Session, SessionState, StartSpec, Termination};
@@ -21,6 +22,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore},
 };
+use tokio_util::sync::CancellationToken;
 
 const MONITOR_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_ACK_WINDOW: Duration = Duration::from_secs(2);
@@ -367,13 +369,18 @@ impl Manager {
         id: &str,
         cursor: u64,
         max: usize,
-        wait: Duration,
         mode: ReadMode,
+        wait: &WaitOptions,
+        cancel: &CancellationToken,
     ) -> Result<Value> {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         let entry = self.get(id)?;
         let reader = entry.session.reader();
-        reader.wait_output(cursor, wait).await;
+        let waited = if !wait.timeout.is_zero() || wait.until.is_some() || wait.idle.is_some() {
+            Some(waiting::wait(&entry.session, cursor, max, mode, wait, cancel).await)
+        } else {
+            None
+        };
         let screen = matches!(mode, ReadMode::Auto | ReadMode::Screen).then(|| reader.screen());
         let mode = match (mode, &screen) {
             (ReadMode::Auto, Some(s)) if s.alternate_screen => ReadMode::Screen,
@@ -434,10 +441,11 @@ impl Manager {
             "mode":mode,"start_cursor":start,"next_cursor":end,"dropped_bytes":dropped,
             "state":snapshot["state"],"termination":snapshot["termination"],
             "silence":notice.map(|candidate|json!({"candidate":candidate,"message":format!("PTY {id} 疑似停滞，请调用 read 检查。")}))});
-        result
-            .as_object_mut()
-            .unwrap()
-            .extend(body.as_object().unwrap().clone());
+        let fields = result.as_object_mut().unwrap();
+        fields.extend(body.as_object().unwrap().clone());
+        if let Some(waited) = waited {
+            fields.insert("wait".into(), json!(waited));
+        }
         Ok(result)
     }
 
