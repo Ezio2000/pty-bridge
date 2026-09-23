@@ -22,6 +22,8 @@ use writer::writer_loop;
 struct State {
     snapshot: Snapshot,
     output: OutputBuffer,
+    /// Emulated screen, advanced under the same lock as `output` so both share one cursor.
+    screen: vt100::Parser,
     requested: Option<Termination>,
     active_write: Option<Instant>,
 }
@@ -119,6 +121,7 @@ impl Inner {
                 state.snapshot.last_output_at_ms = Some(now_ms());
             }
             state.output.append(bytes);
+            state.screen.process(bytes);
         }
         self.changed();
     }
@@ -195,6 +198,7 @@ impl Session {
                     },
                 },
                 output: OutputBuffer::new(OUTPUT_CAPACITY),
+                screen: vt100::Parser::new(spec.rows, spec.cols, 0),
                 requested: None,
                 active_write: None,
             }),
@@ -299,6 +303,7 @@ impl Session {
             let mut state = inner.state.lock().unwrap();
             state.snapshot.rows = rows;
             state.snapshot.cols = cols;
+            state.screen.screen_mut().set_size(rows, cols);
         }
         inner.changed();
         Ok(())

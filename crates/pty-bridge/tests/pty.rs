@@ -1,5 +1,5 @@
 use pty_bridge::protocol::{receive, send};
-use pty_bridge::{manager::Manager, runtime, wait};
+use pty_bridge::{manager::Manager, mcp::ReadMode, runtime, wait};
 use pty_core::{SessionState, StartSpec};
 use serde_json::{Value, json};
 use std::{
@@ -134,7 +134,7 @@ async fn start_is_real_and_late_bgshell_replays_terminal_result() {
         0
     );
     let result = manager
-        .read(&entry.id, 0, 4096, Duration::ZERO)
+        .read(&entry.id, 0, 4096, Duration::ZERO, ReadMode::Auto)
         .await
         .unwrap();
     assert!(
@@ -258,7 +258,7 @@ async fn hooks_inject_owner_acknowledge_read_and_clean_up() {
     );
     let entry = manager.start(&monitor.host, long_running()).await.unwrap();
     let result = manager
-        .read(&entry.id, 0, 4096, Duration::from_secs(1))
+        .read(&entry.id, 0, 4096, Duration::from_secs(1), ReadMode::Auto)
         .await
         .unwrap();
     hook(
@@ -350,4 +350,54 @@ async fn shutdown_racing_start_never_leaves_running_session() {
     for value in manager.snapshots(None).unwrap() {
         assert_eq!(value["state"], "finished");
     }
+}
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_modes_render_text_and_full_screen_programs() {
+    let monitor = Monitor::start().await;
+    let manager = Manager::new().await.unwrap();
+    let entry = manager
+        .start(
+            &monitor.host,
+            command("printf 'ab\\bc\\033[31m!\\033[0m\\r\\n'; sleep 0.3; printf '\\033[?1049h\\033[2;3H\\033[7mSEL\\033[0m'; sleep 30"),
+        )
+        .await
+        .unwrap();
+    let text = manager
+        .read(&entry.id, 0, 4096, Duration::from_secs(1), ReadMode::Auto)
+        .await
+        .unwrap();
+    assert_eq!(text["mode"], "text");
+    assert_eq!(text["output"]["text"], "ac!");
+    assert!(text["output"].get("base64").is_none());
+    let cursor = text["next_cursor"].as_u64().unwrap();
+    let screen = manager
+        .read(
+            &entry.id,
+            cursor,
+            4096,
+            Duration::from_secs(2),
+            ReadMode::Auto,
+        )
+        .await
+        .unwrap();
+    assert_eq!(screen["mode"], "screen");
+    assert_eq!(screen["screen"]["alternate_screen"], true);
+    assert_eq!(screen["screen"]["lines"], json!(["", "  SEL"]));
+    assert_eq!(
+        screen["screen"]["highlights"],
+        json!([{"row":1,"col":2,"len":3}])
+    );
+    let raw = manager
+        .read(&entry.id, 0, 4096, Duration::ZERO, ReadMode::Raw)
+        .await
+        .unwrap();
+    assert!(
+        raw["output"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\u{1b}[?1049h")
+    );
+    manager.close(&entry.id).unwrap();
+    finished(&entry).await;
 }

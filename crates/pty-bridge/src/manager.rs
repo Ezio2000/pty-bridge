@@ -1,5 +1,6 @@
 use crate::{
     MAX_SESSIONS,
+    mcp::ReadMode,
     protocol::{receive, send},
     runtime::{self, Ownership},
     silence::{Candidate, Observation},
@@ -361,18 +362,65 @@ impl Manager {
         Ok(())
     }
 
-    pub async fn read(&self, id: &str, cursor: u64, max: usize, wait: Duration) -> Result<Value> {
+    pub async fn read(
+        &self,
+        id: &str,
+        cursor: u64,
+        max: usize,
+        wait: Duration,
+        mode: ReadMode,
+    ) -> Result<Value> {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         let entry = self.get(id)?;
-        let data = entry.session.reader().read_wait(cursor, max, wait).await;
+        let reader = entry.session.reader();
+        reader.wait_output(cursor, wait).await;
+        let screen = matches!(mode, ReadMode::Auto | ReadMode::Screen).then(|| reader.screen());
+        let mode = match (mode, &screen) {
+            (ReadMode::Auto, Some(s)) if s.alternate_screen => ReadMode::Screen,
+            (ReadMode::Auto, _) => ReadMode::Text,
+            (mode, _) => mode,
+        };
+        // A screen reflects every byte before its end, so its receipt covers them all.
+        let (receipt_start, start, end, dropped, body) = match mode {
+            ReadMode::Screen => {
+                let screen = screen.expect("screen captured for screen mode");
+                let end = screen.end_cursor;
+                (0, cursor.min(end), end, 0, json!({"screen": screen}))
+            }
+            ReadMode::Raw => {
+                let data = reader.read(cursor, max);
+                let text = std::str::from_utf8(&data.bytes);
+                let mut output = json!({"text": String::from_utf8_lossy(&data.bytes), "text_lossy": text.is_err()});
+                if text.is_err() {
+                    output["base64"] = json!(STANDARD.encode(&data.bytes));
+                }
+                (
+                    data.start_cursor,
+                    data.start_cursor,
+                    data.next_cursor,
+                    data.dropped_bytes,
+                    json!({"output": output}),
+                )
+            }
+            _ => {
+                let data = reader.read_text(cursor, max);
+                (
+                    data.start_cursor,
+                    data.start_cursor,
+                    data.next_cursor,
+                    data.dropped_bytes,
+                    json!({"output": {"text": data.text, "rows_dropped": data.rows_dropped}}),
+                )
+            }
+        };
         let receipt = format!("read_{}", uuid::Uuid::new_v4().simple());
         let notice = {
             let mut observation = entry.observation.lock().unwrap();
             let notice = observation.candidate(&entry.session.snapshot());
             observation.receipts.push_back(Receipt {
                 id: receipt.clone(),
-                start: data.start_cursor,
-                end: data.next_cursor,
+                start: receipt_start,
+                end,
                 notice: notice.clone(),
                 at: Instant::now(),
             });
@@ -382,13 +430,15 @@ impl Manager {
             notice
         };
         let snapshot = entry.snapshot();
-        Ok(
-            json!({"instance_id":self.instance,"control_port":self.port,"session_id":id,"receipt_id":receipt,
-            "output":{"text":String::from_utf8_lossy(&data.bytes),"base64":STANDARD.encode(&data.bytes),"text_lossy":std::str::from_utf8(&data.bytes).is_err()},
-            "start_cursor":data.start_cursor,"next_cursor":data.next_cursor,"dropped_bytes":data.dropped_bytes,
+        let mut result = json!({"instance_id":self.instance,"control_port":self.port,"session_id":id,"receipt_id":receipt,
+            "mode":mode,"start_cursor":start,"next_cursor":end,"dropped_bytes":dropped,
             "state":snapshot["state"],"termination":snapshot["termination"],
-            "silence":notice.map(|candidate|json!({"candidate":candidate,"message":format!("PTY {id} 疑似停滞，请调用 read 检查。")}))}),
-        )
+            "silence":notice.map(|candidate|json!({"candidate":candidate,"message":format!("PTY {id} 疑似停滞，请调用 read 检查。")}))});
+        result
+            .as_object_mut()
+            .unwrap()
+            .extend(body.as_object().unwrap().clone());
+        Ok(result)
     }
 
     pub fn observe(&self, id: &str, receipt: &str) -> Result<()> {

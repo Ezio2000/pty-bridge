@@ -62,8 +62,25 @@ pub struct ReadRequest {
     pub session_id: String,
     #[serde(default)]
     pub cursor: u64,
+    /// auto (default): screen while the program uses the alternate screen, otherwise text.
+    /// text: plain text of new output, with line-editor redraws resolved.
+    /// screen: current emulated screen with cursor and reverse-video highlights.
+    /// raw: terminal bytes including escape sequences.
+    #[serde(default)]
+    pub mode: ReadMode,
     pub max_output_bytes: Option<usize>,
     pub yield_time_ms: Option<u64>,
+}
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadMode {
+    #[default]
+    Auto,
+    Text,
+    Screen,
+    Raw,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -151,7 +168,7 @@ impl PtyServer {
 
     #[tool(
         name = "read",
-        description = "Read retained terminal bytes by independent cursor; this is the only tool returning terminal output. start_cursor..next_cursor is the actual returned range; dropped_bytes were lost, not read. base64 preserves all returned bytes. Wait up to yield_time_ms (maximum 30000) without polling. An empty read does not reset silence detection."
+        description = "Read terminal output; this is the only tool returning it. Pass the previous next_cursor as cursor. text mode returns new output as plain text; screen mode returns the whole current screen (use it for menus, full-screen programs and prompts redrawn in place); auto picks screen for full-screen programs, else text. start_cursor..next_cursor is the covered byte range; dropped_bytes were lost, not read. Waits up to yield_time_ms (maximum 30000) for output beyond cursor. An empty read does not reset silence detection."
     )]
     async fn read(
         &self,
@@ -167,6 +184,7 @@ impl PtyServer {
                 req.cursor,
                 max,
                 Duration::from_millis(req.yield_time_ms.unwrap_or(0).min(30000)),
+                req.mode,
             )
             .await
             .map(response)

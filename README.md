@@ -11,12 +11,12 @@ pty-bridge MCP application
     ├── Claude ownership, read acknowledgements, silence policy
     ├── one native bgshell `wait` command per PTY
     └── pty-core
-          ├── reader → terminal protocol → bounded byte buffer
+          ├── reader → terminal protocol → bounded byte buffer + VT100 screen
           ├── single writer ← user input + terminal replies
           └── supervisor → child, process tree, faults, finalization
 ```
 
-`pty-core` is a reusable Rust library with no MCP, Claude, hook, schema, or LLM dependency. It exports `Session`, `PtyWriter`, `PtyReader`, `StartSpec`, snapshots, change subscriptions, structured write results, and platform process locators. `Session::start` creates a real process; `writer().write` confirms input bytes; `reader().read` and `read_wait` return independently addressable byte ranges. `Session::wait` is replayable after completion. Holding a reader or writer keeps the public session alive; dropping the last public handle stops its process tree.
+`pty-core` is a reusable Rust library with no MCP, Claude, hook, schema, or LLM dependency. It exports `Session`, `PtyWriter`, `PtyReader`, `StartSpec`, snapshots, change subscriptions, structured write results, and platform process locators. `Session::start` creates a real process; `writer().write` confirms input bytes; `reader().read` and `read_wait` return independently addressable byte ranges; `reader().read_text` renders a range as plain text and `reader().screen()` returns the emulated screen together with the cursor of the last byte it applied. `Session::wait` is replayable after completion. Holding a reader or writer keeps the public session alive; dropping the last public handle stops its process tree.
 
 The reader never writes to the PTY directly. Terminal responses and user inputs go through one writer queue. Blocking writes hold no lifecycle lock; a separate supervisor can terminate a process tree while input is blocked. macOS/Linux use Unix PTYs and process groups; Windows uses ConPTY and a named Job Object.
 
@@ -53,11 +53,20 @@ claude --plugin-dir ./packages/plugin
 |---|---|
 | `start` | Actual process state, PTY ID, and exact bgshell wait command. A rapidly exiting process still has a replayable completion result. |
 | `write` | `bytes_written`, `interaction_id`, lifecycle state; no output text and no output-wait parameter. Inputs are limited to 64 KiB. |
-| `read` | `output.text`, lossless `output.base64`, `text_lossy`, actual `start_cursor..next_cursor`, `dropped_bytes`, state and optional silence notice. Default maximum is 64 KiB; `yield_time_ms` is capped at 30 seconds. |
+| `read` | Output in the resolved `mode`, actual `start_cursor..next_cursor`, `dropped_bytes`, state and optional silence notice. Default maximum is 64 KiB; `yield_time_ms` is capped at 30 seconds. |
 | `status` | Lifecycle, reason, dimensions, input/output activity timestamps and retained byte range; no terminal body. |
 | `resize` | Changes dimensions without restarting silence observation. |
 | `signal` | `interrupt` writes Ctrl-C; `terminate` and `kill` act on the process tree independently of the writer. |
 | `close` | Idempotently abandons a session. Finished output remains readable. |
+
+`read` modes:
+
+| Mode | Result |
+|---|---|
+| `auto` (default) | `screen` while the program uses the alternate screen, otherwise `text`. |
+| `text` | `output.text`: the byte range rendered on a fresh VT100 emulator of the session width, so line-editor redraws, colors and cursor moves collapse into final text; wrapped rows are joined. A truncated range ends at a line boundary. `rows_dropped` reports rows beyond the 4000-row render limit. |
+| `screen` | `screen`: current rows without trailing blanks, `cursor`, `cursor_visible`, `alternate_screen`, `application_cursor`, and reverse-video `highlights`. It reflects every byte before `next_cursor`, and its receipt acknowledges that whole range. |
+| `raw` | `output.text` with escape sequences and `text_lossy`; `output.base64` only when the bytes are not valid UTF-8. |
 
 Writes have a 5-second deadline. A write failure reports the confirmed byte count and `delivery_uncertain`. At a timeout, an in-flight OS write may not yet have acknowledged all delivered bytes, so the count is a lower bound. Do not automatically retry a partial or uncertain input. A failed or timed-out write ends the session.
 

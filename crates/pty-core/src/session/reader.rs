@@ -1,4 +1,5 @@
 use super::*;
+use crate::render::{self, ScreenSnapshot, TextRead};
 impl PtyReader {
     pub fn read(&self, cursor: u64, max_bytes: usize) -> BufferRead {
         self.owner
@@ -9,7 +10,42 @@ impl PtyReader {
             .output
             .read(cursor, max_bytes)
     }
-    pub async fn read_wait(&self, cursor: u64, max_bytes: usize, timeout: Duration) -> BufferRead {
+    /// The emulated screen and the cursor of the first byte it has not applied.
+    pub fn screen(&self) -> ScreenSnapshot {
+        let state = self.owner.inner.state.lock().unwrap();
+        render::snapshot(state.screen.screen(), state.output.range().1)
+    }
+    /// Renders retained bytes from `cursor` as plain text at the session width.
+    pub fn read_text(&self, cursor: u64, max_bytes: usize) -> TextRead {
+        let (mut data, rows, cols, end) = {
+            let state = self.owner.inner.state.lock().unwrap();
+            let s = &state.snapshot;
+            (
+                state.output.read(cursor, max_bytes),
+                s.rows,
+                s.cols,
+                state.output.range().1,
+            )
+        };
+        // A truncated range ends at a line boundary so the next one starts outside
+        // escape sequences and multibyte characters.
+        if data.next_cursor < end
+            && let Some(last) = data.bytes.iter().rposition(|b| *b == b'\n')
+        {
+            data.bytes.truncate(last + 1);
+            data.next_cursor = data.start_cursor + last as u64 + 1;
+        }
+        let (text, rows_dropped) = render::render_text(&data.bytes, rows, cols);
+        TextRead {
+            text,
+            start_cursor: data.start_cursor,
+            next_cursor: data.next_cursor,
+            dropped_bytes: data.dropped_bytes,
+            rows_dropped,
+        }
+    }
+    /// Waits until output exists at or beyond `cursor`, the session finishes, or `timeout`.
+    pub async fn wait_output(&self, cursor: u64, timeout: Duration) {
         let mut changes = self.owner.inner.changes.subscribe();
         let _ = tokio::time::timeout(timeout, async {
             loop {
@@ -23,6 +59,9 @@ impl PtyReader {
             }
         })
         .await;
+    }
+    pub async fn read_wait(&self, cursor: u64, max_bytes: usize, timeout: Duration) -> BufferRead {
+        self.wait_output(cursor, timeout).await;
         self.read(cursor, max_bytes)
     }
 }
