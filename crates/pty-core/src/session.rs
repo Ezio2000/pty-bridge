@@ -463,6 +463,27 @@ mod tests {
         assert!(result.message.unwrap().contains("injected"));
     }
     #[tokio::test]
+    async fn finished_session_fails_a_write_the_writer_never_acknowledges() {
+        let session = sleeper();
+        let inner = session.owner.inner.clone();
+        // Route input to a queue nobody drains, like a writer blocked in the OS.
+        let (stalled, _held) = mpsc::sync_channel(1);
+        *inner.writer.lock().unwrap() = Some(stalled);
+        let writer = session.writer();
+        let started = Instant::now();
+        let task = tokio::spawn(async move { writer.write(b"x").await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        session.close().unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(4), task)
+            .await
+            .expect("write outlived the session")
+            .unwrap()
+            .unwrap_err();
+        assert!(error.delivery_uncertain);
+        assert!(error.message.contains("finished"));
+        assert!(started.elapsed() < WRITE_TIMEOUT);
+    }
+    #[tokio::test]
     async fn partial_write_failure_reports_confirmed_bytes_and_stops_child() {
         struct FailedWriter {
             wrote: bool,

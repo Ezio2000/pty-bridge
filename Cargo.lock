@@ -674,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "pty-bridge"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -696,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "pty-core"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "anyhow",
  "libc",

@@ -48,7 +48,27 @@ impl PtyWriter {
             return Err(failure("writer queue is full or closed"));
         }
         inner.changed();
-        match tokio::time::timeout(timeout, result).await {
+        // A finished session never acknowledges input, even while the OS write stays blocked.
+        let mut changes = inner.changes.subscribe();
+        let finished = async {
+            while inner.snapshot().state != SessionState::Finished {
+                if changes.changed().await.is_err() {
+                    break;
+                }
+            }
+        };
+        let outcome = tokio::select! {
+            biased;
+            outcome = tokio::time::timeout(timeout, result) => outcome,
+            () = finished => {
+                return Err(WriteFailure {
+                    bytes_written: progress.load(Ordering::SeqCst),
+                    delivery_uncertain: true,
+                    message: "session finished before acknowledging input".into(),
+                });
+            }
+        };
+        match outcome {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(WriteFailure {
                 bytes_written: progress.load(Ordering::SeqCst),
