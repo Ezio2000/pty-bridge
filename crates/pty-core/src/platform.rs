@@ -130,10 +130,11 @@ fn signal_unix(locator: &ProcessLocator, force: bool) -> Result<()> {
         return Ok(());
     }
     let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(error).context("signal PTY process tree")
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(()),
+        // macOS reports EPERM for a group whose members all exited but are not yet reaped.
+        Some(libc::EPERM) if target < 0 => Ok(()),
+        _ => Err(error).context("signal PTY process tree"),
     }
 }
 
@@ -172,5 +173,30 @@ pub fn terminate_tree(locator: &ProcessLocator) -> Result<()> {
         Err(error).context("terminate PTY job")
     } else {
         Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+
+    #[test]
+    fn signaling_a_group_of_exited_unreaped_processes_succeeds() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        // The child exits and stays a zombie until waited on.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let locator = ProcessLocator::Unix {
+            process_id: pid,
+            process_group: Some(pid),
+        };
+        signal_unix(&locator, true).unwrap();
+        child.wait().unwrap();
+        signal_unix(&locator, true).unwrap();
     }
 }

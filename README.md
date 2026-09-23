@@ -100,7 +100,7 @@ States are `starting`, `running`, and `finished`. During finalization, `ending=t
 - The native bgshell receives a final reason and exit code, never a stream of terminal previews. Nonzero target exits and internal failures make the waiting command fail.
 - A broken monitor connection ends every PTY owned by that Claude session. There is no reconnect grace period. Closed connections are checked every 250 ms; an unresponsive connection has a 2-second heartbeat deadline. Reconnecting can only support new PTYs.
 - Disconnecting an established bgshell wait connection ends its PTY. Duplicate waiters cannot displace the original.
-- SessionEnd and MCP shutdown terminate owned process trees. Runtime ownership records include process locators, so SessionEnd can clean up even after the MCP server has disappeared.
+- SessionEnd and MCP shutdown terminate owned process trees. Signaling a process group that already exited succeeds, including macOS's `EPERM` for exited but unreaped members, so `close` stays idempotent. Runtime ownership records include process locators, so SessionEnd can clean up even after the MCP server has disappeared.
 - Output remains in a 1 MiB ring per session. Each MCP instance holds up to 64 active or retained sessions; completed sessions are evicted oldest-first when space is needed.
 
 Runtime files are ordinary JSON containing endpoint/ownership metadata. There are no startup tickets, ticket credentials or delayed target-start attachment phases.
